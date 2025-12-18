@@ -65,14 +65,14 @@ def log_device_diagnostics(device_path):
     except Exception as e:
         print(f"⚠️ Unexpected error opening device: {e}")
 
-    try:
-        siblings = sorted(glob.glob('/dev/tty*'))
-        nearby = [dev for dev in siblings if any(tag in dev for tag in ['USB', 'ACM', 'AMA'])]
-        print("Discovered TTY devices:")
-        for dev in nearby:
-            print(f"  {dev}")
-    except Exception as e:
-        print(f"⚠️ Unable to list /dev/tty* devices: {e}")
+    # try:
+        # siblings = sorted(glob.glob('/dev/tty*'))
+        # nearby = [dev for dev in siblings if any(tag in dev for tag in ['USB', 'ACM', 'AMA'])]
+        # print("Discovered TTY devices:")
+        # for dev in nearby:
+            # print(f"  {dev}")
+    # except Exception as e:
+        # print(f"⚠️ Unable to list /dev/tty* devices: {e}")
 
 
 
@@ -84,7 +84,9 @@ def init_state_machine(pin, device_path='/dev/ttyUSB0'):
     config_content = f"""[gammu]
 device = {device_path}
 connection = at
+baudrate = 9600
 commtimeout = 40
+init_timeout = 10
 """
 
     # Write config to temporary file
@@ -124,13 +126,13 @@ commtimeout = 40
         print("Warning: SIM card not accessible, but device is connected")
     except Exception as e:
         print(f"Error initializing device: {e}")
-        print("Available devices:")
-        try:
-            devices = [d for d in os.listdir('/dev/') if d.startswith('tty')]
-            for device in sorted(devices):
-                print(f"  /dev/{device}")
-        except Exception as inner_e:
-            print(f"⚠️ Unable to list /dev devices: {inner_e}")            
+        # print("Available devices:")
+        # try:
+            # devices = [d for d in os.listdir('/dev/') if d.startswith('tty')]
+            # for device in sorted(devices):
+                # print(f"  /dev/{device}")
+        # except Exception as inner_e:
+            # print(f"⚠️ Unable to list /dev devices: {inner_e}")            
         raise
         
     return sm
