@@ -11,7 +11,7 @@ PORT=$(bashio::config 'port')
 USERNAME=$(bashio::config 'username')
 PASSWORD=$(bashio::config 'password')
 
-bashio::log.info "Device path: ${DEVICE_PATH}"
+bashio::log.info "Device path: '${DEVICE_PATH}'"
 bashio::log.info "Port: ${PORT}"
 
 # Check if device exists
