@@ -6,7 +6,6 @@ Based on: https://github.com/pajikos/sms-gammu-gateway
 Licensed under Apache License 2.0
 """
 
-
 import sys
 import os
 import stat
@@ -126,13 +125,10 @@ commtimeout = 40
     except Exception as e:
         print(f"Error initializing device: {e}")
         print("Available devices:")
-        import os
         try:
             devices = [d for d in os.listdir('/dev/') if d.startswith('tty')]
             for device in sorted(devices):
                 print(f"  /dev/{device}")
-        except:
-            pass
         except Exception as inner_e:
             print(f"⚠️ Unable to list /dev devices: {inner_e}")            
         raise
