@@ -219,22 +219,26 @@ commtimeout = 40
     logging.info(f"📄 Gammu config ({config_file}): device={device_path}, "
                  f"connection={connection}, commtimeout=40")
 
-    for attempt in range(1, INIT_ATTEMPTS + 1):
+    # A pty (URC filter proxy) cannot be re-opened reliably by gammu after a failed
+    # Init, and the raw AT pre-flight already covers modem readiness -> single attempt.
+    attempts = 1 if str(device_path).startswith('/dev/pts/') else INIT_ATTEMPTS
+
+    for attempt in range(1, attempts + 1):
         sm = gammu.StateMachine()
         sm.ReadConfig(Filename=config_file)
         try:
             sm.Init()
             logging.info(f"Successfully initialized gammu with device: {device_path} "
-                         f"(attempt {attempt}/{INIT_ATTEMPTS})")
+                         f"(attempt {attempt}/{attempts})")
             break
         except gammu.ERR_NOSIM:
             logging.warning("SIM card not accessible, but device is connected")
             break
         except Exception as e:
             _release(sm)
-            logging.error(f"Error initializing device (attempt {attempt}/{INIT_ATTEMPTS}): "
+            logging.error(f"Error initializing device (attempt {attempt}/{attempts}): "
                           f"{type(e).__name__}: {e}")
-            if isinstance(e, _TRANSIENT_ERRORS) and attempt < INIT_ATTEMPTS:
+            if isinstance(e, _TRANSIENT_ERRORS) and attempt < attempts:
                 logging.info(f"Retrying in {INIT_RETRY_DELAY}s (modem may not be ready yet)...")
                 time.sleep(INIT_RETRY_DELAY)
                 continue

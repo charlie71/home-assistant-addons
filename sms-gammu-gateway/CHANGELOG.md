@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [1.7.1e] – 2026-09-19 (fork: charlie71)
+## [1.7.1f] – 2026-09-19 (fork: charlie71)
 
 Fork synchronised with upstream 1.7.1 (SIM800/URC filter, `modem_baud_rate`, voice calls, multipart SMS fix, MQTT device id, Ingress fixes).
 
@@ -17,6 +17,8 @@ Fork synchronised with upstream 1.7.1 (SIM800/URC filter, `modem_baud_rate`, voi
 * The removed upstream option `port` is gone; the port is configured in the Network section.
 
 ### Added
+* If the pre-flight finds the modem at a different baud rate than `modem_baud_rate` (autobauding SIM800L after a reset), the detected rate is used for that run instead of failing.
+* With the URC proxy (pty) only one gammu init attempt is made (re-opening the pty failed with `ERR_DEVICEOPENERROR` and hid the real cause).
 * Pre-flight raw `AT` probe at startup (before gammu) - shows within seconds whether the modem answers and at which baud rate.
 * Startup log of gammu / python-gammu versions, used connection and generated gammu config.
 * `init_state_machine`: max. 3 attempts (5 s pause) for transient errors (`ERR_TIMEOUT`, `ERR_DEVICEREADERROR`), StateMachine released after each failed attempt; no endless retry.

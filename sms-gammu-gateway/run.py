@@ -145,7 +145,11 @@ _answering, _usable = probe_serial_at(device_path, _preflight_bauds)
 if _answering:
     logging.info(f"✅ Pre-flight: modem answers AT at {_answering} baud (configured: {baud_rate})")
     if baud_rate != 'auto' and int(baud_rate) != _answering:
-        logging.warning(f"⚠️ Configured modem_baud_rate {baud_rate} differs - set modem_baud_rate to {_answering}")
+        # An autobauding SIM800L may lock onto another speed after a reset/brownout.
+        # Use the speed the modem really answers at instead of failing on a mismatch.
+        logging.warning(f"⚠️ Configured modem_baud_rate {baud_rate} differs - using detected {_answering} "
+                        f"for this run. To make it permanent set the modem to a fixed speed (AT+IPR=<baud>;&W).")
+        baud_rate = str(_answering)
 elif _usable:
     logging.error("❌ Pre-flight: modem does NOT answer AT at any baud rate - check wiring (TX/RX), "
                   "GND, power supply and UART overlay; gammu init will most likely time out")
