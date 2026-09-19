@@ -6,7 +6,7 @@
 ![Supports armv7 Architecture][armv7-shield]
 ![Supports i386 Architecture][i386-shield]
 
-REST API SMS Gateway using python-gammu for USB GSM modems (SIM800L, Huawei, etc.)
+REST API SMS Gateway using python-gammu for USB GSM modems. Developed and tested with **SIM800L**; other modems may work but are community-supported.
 
 ## About
 
@@ -19,6 +19,8 @@ This add-on provides a complete SMS gateway solution for Home Assistant, replaci
 ### 📱 SMS Management
 - **Send SMS** via REST API, MQTT, or Home Assistant UI
 - **Flash SMS Support** ⚡ - Send urgent alerts that display on screen without saving to inbox (Class 0)
+- **Real-time Call Monitoring** 📞 - Detect incoming calls and missed calls in real-time via Gammu callbacks
+- **Voice Calls** 📞 *(Experimental)* - Dial numbers via REST API or MQTT button (call rings ~35s, ~2 min recovery after call)
 - **Receive SMS** with automatic MQTT notifications
 - **Text Input Fields** directly in Home Assistant device
 - **Smart Buttons** for easy SMS sending from UI (normal + flash)
@@ -51,10 +53,23 @@ This add-on provides a complete SMS gateway solution for Home Assistant, replaci
 
 ## Prerequisites
 
-- USB GSM modem supporting AT commands (SIM800L, Huawei E1750, etc.)
+- USB GSM modem supporting AT commands (see **Supported hardware** below)
 - Modem must appear as `/dev/ttyUSB*` device
 - SIM card with SMS capability
 - Optional: MQTT broker for full integration
+
+## Supported hardware
+
+This add-on is **developed and tested exclusively with SIM800L** modems — that's the hardware the author owns and verifies releases against.
+
+Other modems (Huawei, Quectel EC25, ZTE, etc.) **may work**, and many do, but they are **community-supported**: the author can't test or debug hardware he doesn't own. Modem-specific quirks — init failures (`Code 27`/`Code 14`), `GSM Network: Unknown`, voice calling, multipart timing — depend heavily on the individual modem's firmware and USB interface layout.
+
+What this means in practice:
+- ✅ **SIM800L issues** are first-class and will be investigated.
+- 🤝 **Other modems**: I'm happy to point you in the right direction, and if the community figures out a working recipe I'll gladly link or incorporate it — but bug reports that require modem-specific hardware I can't reproduce may be closed as *not planned*.
+- 💡 If your modem works with raw AT commands (e.g. via `microcom`) but not here, it's usually a startup-timing / unsolicited-message (URC) quirk specific to that modem family.
+
+If reliable operation matters to you, a **SIM800L-based module is the recommended choice**.
 
 ## Installation
 
@@ -67,6 +82,126 @@ This add-on provides a complete SMS gateway solution for Home Assistant, replaci
 4. Configure the add-on (see below)
 5. Start the add-on
 
+## 🐳 Standalone Docker (without HA Supervisor)
+
+If you run Home Assistant as a manual Docker container (HA Container) — or you don't use Home Assistant at all — you can still run the gateway as a standalone Docker container. The MQTT auto-discovery will integrate it into HA the same way as the add-on.
+
+> Thanks to [@mickeyreg](https://github.com/PavelVe/home-assistant-addons/issues/15#issuecomment-4582397033) for figuring this out.
+
+**Limitations:**
+- The HA Ingress web UI is not available — access the web UI directly on port `5000`.
+- You'll need to manage the `options.json` file yourself instead of using the HA add-on UI.
+
+> **Multiple instances:** Since v1.6.5 you can run multiple gateways on the same MQTT broker. Set a unique `mqtt_device_id` (e.g. `sms_gateway_2`) and matching `mqtt_topic_prefix` for each instance.
+
+### Step 1 — Clone the repository
+
+```bash
+git clone https://github.com/PavelVe/home-assistant-addons.git
+cd home-assistant-addons/sms-gammu-gateway/
+```
+
+### Step 2 — Create `run-standalone.sh`
+
+The default `run.sh` uses `bashio` (Home Assistant Supervisor only). Create a standalone version next to it:
+
+```bash
+#!/bin/bash
+set -e
+
+echo "Starting SMS Gammu Gateway..."
+
+DEVICE_PATH=$(python3 -c "import json; print(json.load(open('/data/options.json'))['device_path'])")
+if [ ! -c "${DEVICE_PATH}" ]; then
+    echo "WARNING: Device ${DEVICE_PATH} not found. Please check your GSM modem connection."
+    echo "Available tty devices:"
+    ls -la /dev/tty* || true
+fi
+
+cd /app
+exec python3 -u run.py
+```
+
+Then point the Dockerfile at it:
+
+```bash
+sed -i.bak 's|run.sh|run-standalone.sh|g' Dockerfile
+```
+
+(Or edit `Dockerfile` manually — replace `run.sh` with `run-standalone.sh` in the `COPY` and `CMD` lines.)
+
+### Step 3 — Create `options.json`
+
+This file replaces the HA add-on configuration UI. Adjust values to your setup:
+
+```json
+{
+  "device_path": "/dev/serial/by-id/usb-HUAWEI_Technology_HUAWEI_Mobile-if0",
+  "pin": "",
+  "ssl": false,
+  "username": "admin",
+  "password": "admin",
+  "mqtt_enabled": true,
+  "mqtt_host": "192.168.1.10",
+  "mqtt_port": 1883,
+  "mqtt_username": "your_mqtt_user",
+  "mqtt_password": "your_mqtt_password",
+  "mqtt_topic_prefix": "homeassistant/sensor/sms_gateway",
+  "mqtt_device_id": "sms_gateway",
+  "sms_monitoring_enabled": true,
+  "sms_check_interval": 30,
+  "sms_cost_per_message": 0.0,
+  "sms_cost_currency": "EUR",
+  "auto_delete_read_sms": false,
+  "sms_delete_delay_seconds": 0,
+  "missed_calls_monitoring_enabled": true,
+  "incoming_call_auto_reset_seconds": 10,
+  "voice_call_enabled": false
+}
+```
+
+> **Tip:** Prefer a stable device path like `/dev/serial/by-id/...` over `/dev/ttyUSB0` — the latter can change after reboot or reconnect. See [Device Path Options](#device-path-options) below for details.
+
+### Step 4 — Create `docker-compose.yml`
+
+```yaml
+services:
+  sms-gammu-gateway:
+    image: sms-gammu-gateway
+    container_name: sms-gammu-gateway
+    restart: unless-stopped
+    devices:
+      - /dev/ttyUSB0:/dev/ttyUSB0
+    volumes:
+      - ./sms-gateway-data:/data
+    ports:
+      - "5000:5000"
+    privileged: true
+```
+
+Adjust the `devices:` entry to match your actual modem device.
+
+### Step 5 — Build and run
+
+```bash
+mkdir -p sms-gateway-data
+cp options.json sms-gateway-data/options.json
+
+docker build --build-arg BUILD_FROM=ghcr.io/home-assistant/amd64-base:3.19 -t sms-gammu-gateway .
+docker compose up -d
+docker logs -f sms-gammu-gateway
+```
+
+For other architectures replace `amd64-base` with `aarch64-base`, `armv7-base`, `armhf-base`, or `i386-base`.
+
+After startup the modem should appear in Home Assistant under MQTT auto-discovered devices (assuming the MQTT integration is configured and pointed at the same broker).
+
+To stop:
+
+```bash
+docker compose down
+```
+
 ## Configuration
 
 ### Basic Settings
@@ -74,8 +209,9 @@ This add-on provides a complete SMS gateway solution for Home Assistant, replaci
 | Option | Default | Description |
 |--------|---------|-------------|
 | `device_path` | `/dev/ttyUSB0` | Path to your GSM modem device (see Device Path Options below) |
+| `modem_baud_rate` | `115200` | Serial speed of the modem. A fixed number (recommended) avoids gammu's baud-rate auto-detection hanging on some modules (e.g. SIM800/SIM800C). Use `auto` for the old auto-detect behavior, or any custom value (`9600`, `460800`, …). |
+| `urc_filter_enabled` | `true` | Filter out spurious modem status messages such as `OVER-VOLTAGE WARNNING` that can freeze gammu communication (typical for SIM800). Keep enabled unless you have a reason to disable. |
 | `pin` | `""` | SIM card PIN (leave empty if no PIN) |
-| `port` | `5000` | API port |
 | `ssl` | `false` | Enable HTTPS |
 | `username` | `admin` | API username |
 | `password` | `password` | API password (change this!) |
@@ -111,6 +247,7 @@ ls -la /dev/serial/by-id/
 | `mqtt_username` | `""` | MQTT username |
 | `mqtt_password` | `""` | MQTT password |
 | `mqtt_topic_prefix` | `homeassistant/sensor/sms_gateway` | Topic prefix |
+| `mqtt_device_id` | `sms_gateway` | Unique device identifier for HA auto-discovery. Change only when running multiple instances on the same MQTT broker (e.g. `sms_gateway_2`). |
 | `sms_monitoring_enabled` | `true` | Auto-detect incoming SMS |
 | `sms_check_interval` | `60` | SMS check interval (seconds) |
 
@@ -120,6 +257,10 @@ ls -la /dev/serial/by-id/
 |--------|---------|-------------|
 | `sms_cost_per_message` | `0.0` | Cost per SMS (set to 0 to disable cost tracking sensor) |
 | `auto_delete_read_sms` | `true` | Automatically delete SMS after reading |
+| `sms_delete_delay_seconds` | `0` | Delay (0–300 s) before auto-deleting a read SMS; `0` = delete immediately |
+| `missed_calls_monitoring_enabled` | `false` | Enable incoming/missed call detection (requires modem support) |
+| `incoming_call_auto_reset_seconds` | `60` | Auto-reset incoming call state after N seconds (10-300) |
+| `voice_call_enabled` | `false` | **Experimental:** Enable voice calls (see limitations below) |
 
 ### Example Configuration
 
@@ -130,7 +271,6 @@ device_path: "/dev/serial/by-id/usb-1a86_USB_Serial-if00-port0"
 # device_path: "/dev/ttyUSB0"
 
 pin: ""
-port: 5000
 ssl: false
 username: "admin"
 password: "your_secure_password"
@@ -156,6 +296,14 @@ Enable MQTT in configuration and the add-on will automatically create:
 - 💬 **Message Text** text input
 - 🔘 **Send SMS** button
 - ⚡ **Send Flash SMS** button (urgent alerts - displays on screen without saving)
+- 📞 **Incoming Call** binary sensor (if enabled) - real-time ringing detection
+  - State: ON = ringing, OFF = not ringing
+  - Attributes: Number, ring_start, ring_count
+- 📞 **Last Missed Call** sensor (if enabled)
+  - State: caller phone number
+  - Attributes: ring_start, ring_end, ring_duration_seconds, ring_count, processed_at
+- 📞 **Dial Call** button (if voice calls enabled) - dial the number from Phone Number field
+- 📞 **Outgoing Call** binary sensor (if voice calls enabled) - ON/OFF with number attribute
 
 All entities appear under device **"SMS Gateway"** in Home Assistant.
 
@@ -225,7 +373,89 @@ automation:
         target: '+420123456789'
 ```
 
+### Call Monitoring Automations
+
+```yaml
+# Notification when phone is ringing
+automation:
+  - alias: "Phone Ringing Alert"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.sms_gateway_incoming_call
+        to: "on"
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "Incoming Call"
+          message: "Calling: {{ state_attr('binary_sensor.sms_gateway_incoming_call', 'Number') }}"
+
+# Notification for missed call
+automation:
+  - alias: "Missed Call Alert"
+    trigger:
+      - platform: state
+        entity_id: sensor.sms_gateway_last_missed_call
+    action:
+      - service: notify.mobile_app
+        data:
+          title: "Missed Call"
+          message: >
+            From: {{ states('sensor.sms_gateway_last_missed_call') }}
+            Duration: {{ state_attr('sensor.sms_gateway_last_missed_call', 'ring_duration_seconds') }}s
+```
+
+### Voice Call Automations (Experimental)
+
+> **Warning:** Voice call support is experimental. After each call, the modem needs ~2 minutes to recover. During this time, SMS and other modem operations are unavailable. See details below.
+
+```yaml
+# Doorbell alert - dial number (rings ~35s then ends automatically)
+automation:
+  - alias: "Doorbell Call Alert"
+    trigger:
+      - platform: state
+        entity_id: binary_sensor.doorbell
+        to: "on"
+    action:
+      - service: rest_command.dial_call
+        data:
+          number: "+420123456789"
+```
+
+To use `rest_command.dial_call`, add to `configuration.yaml`:
+
+```yaml
+rest_command:
+  dial_call:
+    url: "http://localhost:5000/calls/dial"
+    method: POST
+    content_type: "application/json"
+    username: "admin"
+    password: "your_password"
+    payload: '{"number": "{{ number }}"}'
+```
+
+**Voice Call — How It Works:**
+
+1. Addon sends `ATD` command to modem via Gammu `DialVoice()`
+2. Phone rings for ~35 seconds (controlled by GSM network, not the addon)
+3. Call ends automatically when the other party answers/rejects or network times out
+4. **All modem operations are paused** during the call (SMS monitoring, signal checks, ReadDevice) to prevent serial port conflicts
+5. After the call, a **~2 minute recovery** is needed:
+   - 5 seconds: ReadDevice flushes `NO CARRIER` response from modem buffer
+   - ~85 seconds: Gammu connection is re-initialized (`Terminate()` + `Init()`) and callbacks are re-registered
+6. Normal operations resume automatically after recovery
+
+**Limitations:**
+- **Hangup is not supported** — GSM modems (SIM800C, SIM800L, etc.) don't respond to Gammu's `CancelCall` command during active voice calls (40s timeout, no effect). This is a known Gammu/modem limitation.
+- **~2 min modem downtime** after each call — voice calls leave the modem in an inconsistent state that requires full Gammu re-initialization. During this time, SMS sending/receiving is temporarily unavailable.
+- **No call duration control** — the call duration is determined by the GSM network timeout (~35s), not the addon
+- **Disabled by default** — enable in addon config (`voice_call_enabled: true`)
+- **Recommended for alarm/notification use only** — e.g., doorbell rings, security alerts where you just need to ring someone's phone
+
 ### REST API Examples
+
+> **Note:** Port 5000 is the default. You can change it in Home Assistant add-on Network settings.
 
 ```bash
 # Normal SMS
@@ -241,6 +471,14 @@ curl -X POST http://192.168.1.x:5000/sms \
   -d '{"text": "URGENT!", "number": "+420123456789", "flash": true}'
 ```
 
+```bash
+# Dial voice call (rings ~40s then ends automatically)
+curl -X POST http://192.168.1.x:5000/calls/dial \
+  -H "Content-Type: application/json" \
+  -u admin:password \
+  -d '{"number": "+420123456789"}'
+```
+
 **Flash SMS Notes:**
 - Flash SMS displays immediately on phone screen
 - Message is NOT saved to inbox
@@ -251,7 +489,9 @@ curl -X POST http://192.168.1.x:5000/sms \
 ## 🔧 API Documentation
 
 ### Swagger UI
-Access full API documentation at: `http://your-ha-ip:5000/docs/`
+Access full API documentation via:
+- **Ingress** (recommended): Click "Open Web UI" in Home Assistant add-on panel, then click "Open Swagger API Documentation"
+- **Direct access**: `http://your-ha-ip:PORT/docs/` (PORT is configurable in Network settings)
 
 ![Swagger UI Documentation](https://raw.githubusercontent.com/pavelve/home-assistant-addons/main/sms-gammu-gateway/images/swagger-ui.png)
 
@@ -263,6 +503,7 @@ Access full API documentation at: `http://your-ha-ip:5000/docs/`
 | GET | `/sms` | Get all SMS | Yes |
 | GET | `/sms/{id}` | Get specific SMS | Yes |
 | DELETE | `/sms/{id}` | Delete SMS | Yes |
+| POST | `/calls/dial` | Dial voice call | Yes |
 | GET | `/status/signal` | Signal strength | No |
 | GET | `/status/network` | Network info | No |
 | GET | `/status/reset` | Reset modem | No |
@@ -279,6 +520,20 @@ Access full API documentation at: `http://your-ha-ip:5000/docs/`
 - Try different USB ports
 - Check `dmesg | grep tty` for device detection
 
+### Modem Freezes / SMS Not Being Read (SIM800 / SIM800C)
+Symptoms: the addon initializes the device but every operation then times out
+(`GetSignalQuality timed out`), no SMS are read, entities go unavailable.
+
+Two common causes, both addressed since **v1.7.0**:
+1. **Baud-rate auto-detection hangs.** Set `modem_baud_rate` to a fixed value
+   (default `115200`). Most modems incl. SIM800/SIM800C work on `115200`.
+2. **The modem floods the line with `OVER-VOLTAGE WARNNING`** (or similar power
+   URCs), which interleave with AT responses and freeze gammu. Keep
+   `urc_filter_enabled: true` (default) so these lines are filtered out before
+   they reach gammu.
+
+If after the update the modem does not start at all, try `modem_baud_rate: auto`.
+
 ### SMS Not Sending
 - Check signal strength (should be > 20%)
 - Verify SIM card has credit
@@ -290,11 +545,31 @@ Access full API documentation at: `http://your-ha-ip:5000/docs/`
 - Check MQTT credentials
 - Look for connection errors in add-on logs
 - Ensure topic prefix doesn't conflict
+- If broker starts after addon, the addon auto-retries connection for up to 5 minutes
 
 ### Code 69 Error
 - This is SMSC (SMS Center) issue
 - Add-on automatically uses Location 1 fallback
 - Works same as REST API
+
+### Call Monitoring Not Working
+Check addon logs for message "Call callback: NOT SUPPORTED".
+
+**How it works:**
+- Uses Gammu `SetIncomingCall()` callback for real-time detection
+- `ReadDevice()` runs every 1s to process incoming events
+- Does NOT require MC (Missed Calls) memory - works on SIM800L!
+
+**Supported modems:**
+- SIM800L, SIM800C, SIM800H (tested!)
+- Huawei E3372, E173, E220
+- Quectel M66, MC60, EC25
+- Most modems with CLIP (Calling Line Identification) support
+
+**If not working:**
+- Check if modem supports CLIP (AT+CLIP=1)
+- Try enabling/disabling and restart addon
+- Some virtual modems may not support call events
 
 ## 📋 Version History
 

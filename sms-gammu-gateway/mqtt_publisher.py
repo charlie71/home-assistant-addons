@@ -8,6 +8,7 @@ import time
 import logging
 import threading
 import os
+from datetime import datetime
 from typing import Optional, Dict, Any
 import paho.mqtt.client as mqtt
 import concurrent.futures
@@ -16,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 # SMS counter persistence file
 SMS_COUNTER_FILE = '/data/sms_counter.json'
+SMS_LAST_PROCESSED_FILE = '/data/sms_last_processed.json'
 
 def detect_unicode_needed(text: str) -> bool:
     """Detect if text contains non-ASCII characters requiring Unicode encoding"""
@@ -76,6 +78,57 @@ class SMSCounter:
     def get_count(self):
         """Get current count"""
         return self.sent_count
+
+class SMSProcessedTracker:
+    """Tracks last processed SMS timestamp to prevent re-triggering after restart"""
+
+    def __init__(self, state_file: str = SMS_LAST_PROCESSED_FILE):
+        self.state_file = state_file
+        self.last_processed_time = None
+        self._load()
+
+    def _load(self):
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    data = json.load(f)
+                    ts = data.get('last_processed_time')
+                    if ts:
+                        self.last_processed_time = datetime.strptime(ts, '%Y-%m-%d %H:%M:%S')
+                        logger.info(f"📱 Loaded last processed SMS time: {ts}")
+        except Exception as e:
+            logger.error(f"Error loading SMS processed state: {e}")
+
+    def update(self, sms_datetime=None):
+        """Update last processed time (now or from SMS datetime)"""
+        self.last_processed_time = sms_datetime or datetime.now()
+        self._save()
+
+    def _save(self):
+        try:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            ts = self.last_processed_time.strftime('%Y-%m-%d %H:%M:%S') if self.last_processed_time else None
+            with open(self.state_file, 'w') as f:
+                json.dump({'last_processed_time': ts}, f)
+        except Exception as e:
+            logger.error(f"Error saving SMS processed state: {e}")
+
+    def is_new_sms(self, sms_data):
+        """Check if SMS is newer than last processed time"""
+        if self.last_processed_time is None:
+            return True
+        sms_dt = sms_data.get('DateTime') or sms_data.get('Date')
+        if not sms_dt:
+            return True
+        if isinstance(sms_dt, str):
+            try:
+                sms_dt = datetime.strptime(sms_dt, '%Y-%m-%d %H:%M:%S')
+            except ValueError:
+                return True
+        if isinstance(sms_dt, datetime):
+            return sms_dt > self.last_processed_time
+        return True
+
 
 class DeviceConnectivityTracker:
     """Tracks USB GSM device connectivity status based on gammu communication"""
@@ -158,6 +211,7 @@ class MQTTPublisher:
         self.connected = False
         self.disconnecting = False  # Flag to prevent multiple disconnect calls
         self.topic_prefix = config.get('mqtt_topic_prefix', 'homeassistant/sensor/sms_gateway')
+        self.device_id = config.get('mqtt_device_id', 'sms_gateway')
         self.availability_topic = f"{self.topic_prefix}/availability"  # Shared availability for all entities
         self.gammu_machine = None  # Will be set externally
         self.gammu_lock = threading.Lock()  # Serialize all Gammu operations to prevent race conditions
@@ -165,6 +219,26 @@ class MQTTPublisher:
         self.current_message_text = ""  # Current message text from text input
         self.device_tracker = DeviceConnectivityTracker()  # USB device connectivity tracking
         self.sms_counter = SMSCounter()  # SMS counter with persistence
+        self.sms_processed = SMSProcessedTracker()  # Prevents SMS re-triggering after restart
+
+        # Call monitoring (real-time via Gammu callbacks)
+        self.call_monitoring_enabled = False
+        self.call_queue = []  # [{'number': str, 'ring_start': datetime, 'ring_count': int}, ...]
+        self.MAX_CALL_QUEUE_SIZE = 5  # Maximum number of concurrent calls in queue
+        self._read_device_thread = None
+        self._call_auto_reset_timer = None  # Timer for auto-resetting incoming call state
+
+        # Outgoing call state
+        self._auto_hangup_timer = None
+        self._outgoing_call_active = False
+        self._call_active_until = None  # Timestamp when call should be over
+        self._post_call_recovery_until = None  # Post-call recovery period (ReadDevice only)
+
+        # SMS callback (faster delivery, polling as fallback)
+        self.sms_callback_enabled = False
+        self._sms_callback_pending = False  # flag že přišla SMS
+        self._sms_callback_timer = None     # debounce timer
+        self._sms_process_callback = None   # callback pro zpracování SMS
 
         if config.get('mqtt_enabled', False):
             self._setup_client()
@@ -179,7 +253,7 @@ class MQTTPublisher:
         try:
             # Create client with unique ID for better connection tracking
             import socket
-            client_id = f"sms_gateway_{socket.gethostname()}"
+            client_id = f"{self.device_id}_{socket.gethostname()}"
             self.client = mqtt.Client(client_id=client_id, clean_session=True)
 
             # Set credentials ONLY if username is provided and not empty
@@ -197,7 +271,7 @@ class MQTTPublisher:
                 logger.info(f"MQTT: Client ID: {client_id}, Using authentication with username: '{username}'")
             else:
                 logger.info(f"MQTT: Client ID: {client_id}, Connecting without authentication (local broker mode)")
-            
+
             # Set callbacks
             self.client.on_connect = self._on_connect
             self.client.on_disconnect = self._on_disconnect
@@ -209,16 +283,46 @@ class MQTTPublisher:
             self.client.will_set(self.availability_topic, "offline", qos=1, retain=True)
             logger.info("📡 MQTT Last Will set: all entities will be unavailable if connection lost")
 
+            # Automatic reconnect after initial connection (paho-mqtt built-in)
+            self.client.reconnect_delay_set(min_delay=1, max_delay=30)
+
             # Connect to broker
             host = self.config.get('mqtt_host', 'core-mosquitto')
             port = self.config.get('mqtt_port', 1883)
 
             logger.info(f"Connecting to MQTT broker: {host}:{port}")
-            self.client.connect(host, port, 60)
-            self.client.loop_start()
-            
+            try:
+                self.client.connect(host, port, 60)
+                self.client.loop_start()
+            except Exception as e:
+                logger.warning(f"📡 MQTT broker not available at startup: {e}")
+                logger.info("📡 Starting background retry thread...")
+                self._connect_with_retry(host, port)
+
         except Exception as e:
             logger.error(f"Failed to setup MQTT client: {e}")
+
+    def _connect_with_retry(self, host, port):
+        """Background thread that retries MQTT connection until successful"""
+        def _retry_loop():
+            retry_interval = 5
+            max_attempts = 60  # 5 minut
+            for attempt in range(1, max_attempts + 1):
+                if self.disconnecting:
+                    return
+                time.sleep(retry_interval)
+                try:
+                    self.client.connect(host, port, 60)
+                    self.client.loop_start()
+                    logger.info(f"📡 MQTT connected after {attempt} retries")
+                    return
+                except Exception:
+                    if attempt % 6 == 0:  # Log každých 30s
+                        logger.warning(f"📡 MQTT broker still unavailable (attempt {attempt}/{max_attempts})")
+            logger.error("📡 MQTT connection failed after 5 minutes of retrying")
+
+        thread = threading.Thread(target=_retry_loop, daemon=True, name="mqtt-retry")
+        thread.start()
     
     def _on_connect(self, client, userdata, flags, rc):
         """Callback for MQTT connection"""
@@ -256,6 +360,13 @@ class MQTTPublisher:
             client.subscribe(delete_all_sms_topic)
             logger.info(f"Subscribed to delete all SMS topic: {delete_all_sms_topic}")
 
+            # Subscribe to voice call button topics
+            if self.config.get('voice_call_enabled', False):
+                dial_topic = f"{self.topic_prefix}/dial_button"
+                client.subscribe(dial_topic)
+                logger.info(f"Subscribed to dial call topic: {dial_topic}")
+
+
             # Subscribe to text input topics
             phone_topic = f"{self.topic_prefix}/phone_number/set"
             message_topic = f"{self.topic_prefix}/message_text/set"
@@ -273,7 +384,10 @@ class MQTTPublisher:
     def _on_disconnect(self, client, userdata, rc):
         """Callback for MQTT disconnection"""
         self.connected = False
-        logger.warning("Disconnected from MQTT broker")
+        if rc == 0:
+            logger.info("📡 Disconnected from MQTT broker (clean)")
+        else:
+            logger.warning(f"📡 Unexpected MQTT disconnect (rc={rc}), auto-reconnecting...")
     
     def _on_publish(self, client, userdata, mid):
         """Callback for published messages"""
@@ -329,6 +443,24 @@ class MQTTPublisher:
                 # Message text state received (sync with HA)
                 self.current_message_text = payload
                 logger.info(f"Message text synced from HA state: {payload}")
+
+            # Voice call buttons
+            elif topic == f"{self.topic_prefix}/dial_button":
+                number = self.current_phone_number
+                if number and self.gammu_machine:
+                    logger.info(f"📞 MQTT dial request: {number}")
+                    try:
+                        # Set call active BEFORE DialVoice to prevent ReadDevice race condition
+                        self._call_active_until = time.time() + 40  # 35s call + 5s buffer
+                        self.track_gammu_operation("DialVoice", self.gammu_machine.DialVoice, number)
+                        self.publish_outgoing_call_state(True, number)
+                        logger.info("📞 Call active, gammu operations paused for ~40s")
+                    except Exception as e:
+                        self._call_active_until = None  # Clear on failure
+                        logger.error(f"Failed to dial {number}: {e}")
+                else:
+                    logger.warning("📞 Dial request but no phone number set or gammu not available")
+
 
         except Exception as e:
             logger.error(f"Error processing MQTT message on topic {msg.topic}: {e}")
@@ -588,7 +720,7 @@ class MQTTPublisher:
                             # Try different folder IDs (0=Inbox, 1=Outbox, 2=Sent, etc.)
                             for folder in [0, 1, 2]:
                                 try:
-                                    self.gammu_machine.DeleteSMS(folder, location)
+                                    self.track_gammu_operation("DeleteSMS", self.gammu_machine.DeleteSMS, folder, location)
                                     deleted_count += 1
                                     deleted_this_location = True
                                     logger.info(f"✅ Deleted SMS at folder={folder}, location={location}")
@@ -684,9 +816,10 @@ class MQTTPublisher:
             return
 
         # Common device config for all entities
+        device_name = "SMS Gateway" if self.device_id == "sms_gateway" else f"SMS Gateway ({self.device_id})"
         DEVICE_CONFIG = {
-            "identifiers": ["sms_gateway"],
-            "name": "SMS Gateway",
+            "identifiers": [self.device_id],
+            "name": device_name,
             "model": "GSM Modem",
             "manufacturer": "Gammu Gateway"
         }
@@ -701,7 +834,7 @@ class MQTTPublisher:
         # Signal strength sensor
         signal_config = {
             "name": "GSM Signal Strength",
-            "unique_id": "sms_gateway_signal",
+            "unique_id": f"{self.device_id}_signal",
             "state_topic": f"{self.topic_prefix}/signal/state",
             "value_template": "{{ value_json.SignalPercent }}",
             "unit_of_measurement": "%",
@@ -713,7 +846,7 @@ class MQTTPublisher:
         # Network info sensor
         network_config = {
             "name": "GSM Network",
-            "unique_id": "sms_gateway_network",
+            "unique_id": f"{self.device_id}_network",
             "state_topic": f"{self.topic_prefix}/network/state",
             "value_template": "{{ value_json.NetworkName }}",
             "icon": "mdi:network",
@@ -724,7 +857,7 @@ class MQTTPublisher:
         # Last SMS sensor
         sms_config = {
             "name": "Last SMS Received",
-            "unique_id": "sms_gateway_last_sms",
+            "unique_id": f"{self.device_id}_last_sms",
             "state_topic": f"{self.topic_prefix}/sms/state",
             "value_template": "{{ value_json.Text }}",
             "json_attributes_topic": f"{self.topic_prefix}/sms/state",
@@ -736,7 +869,7 @@ class MQTTPublisher:
         # SMS send status sensor
         send_status_config = {
             "name": "SMS Send Status",
-            "unique_id": "sms_gateway_send_status",
+            "unique_id": f"{self.device_id}_send_status",
             "state_topic": f"{self.topic_prefix}/send_status",
             "value_template": "{{ value_json.status }}",
             "json_attributes_topic": f"{self.topic_prefix}/send_status",
@@ -748,7 +881,7 @@ class MQTTPublisher:
         # SMS delete status sensor
         delete_status_config = {
             "name": "SMS Delete Status",
-            "unique_id": "sms_gateway_delete_status",
+            "unique_id": f"{self.device_id}_delete_status",
             "state_topic": f"{self.topic_prefix}/delete_sms_status",
             "value_template": "{{ value_json.status }}",
             "json_attributes_topic": f"{self.topic_prefix}/delete_sms_status",
@@ -760,7 +893,7 @@ class MQTTPublisher:
         # SMS send button
         button_config = {
             "name": "Send SMS",
-            "unique_id": "sms_gateway_send_button",
+            "unique_id": f"{self.device_id}_send_button",
             "command_topic": f"{self.topic_prefix}/send_button",
             "payload_press": "PRESS",
             "icon": "mdi:message-plus",
@@ -771,7 +904,7 @@ class MQTTPublisher:
         # Flash SMS send button
         flash_button_config = {
             "name": "Send Flash SMS",
-            "unique_id": "sms_gateway_send_flash_button",
+            "unique_id": f"{self.device_id}_send_flash_button",
             "command_topic": f"{self.topic_prefix}/send_flash_button",
             "payload_press": "PRESS",
             "icon": "mdi:message-flash",
@@ -782,7 +915,7 @@ class MQTTPublisher:
         # Phone number input text
         phone_text_config = {
             "name": "Phone Number",
-            "unique_id": "sms_gateway_phone_number",
+            "unique_id": f"{self.device_id}_phone_number",
             "command_topic": f"{self.topic_prefix}/phone_number/set",
             "state_topic": f"{self.topic_prefix}/phone_number/state",
             "icon": "mdi:phone",
@@ -795,7 +928,7 @@ class MQTTPublisher:
         # Message input text
         message_text_config = {
             "name": "Message Text",
-            "unique_id": "sms_gateway_message_text",
+            "unique_id": f"{self.device_id}_message_text",
             "command_topic": f"{self.topic_prefix}/message_text/set",
             "state_topic": f"{self.topic_prefix}/message_text/state",
             "icon": "mdi:message-text",
@@ -808,7 +941,7 @@ class MQTTPublisher:
         # Modem Status sensor
         device_status_config = {
             "name": "Modem Status",
-            "unique_id": "sms_gateway_modem_status",
+            "unique_id": f"{self.device_id}_modem_status",
             "state_topic": f"{self.topic_prefix}/device_status/state",
             "value_template": "{{ value_json.status }}",
             "json_attributes_topic": f"{self.topic_prefix}/device_status/state",
@@ -820,7 +953,7 @@ class MQTTPublisher:
         # SMS Counter sensor
         sms_counter_config = {
             "name": "SMS Sent Count",
-            "unique_id": "sms_gateway_sent_count",
+            "unique_id": f"{self.device_id}_sent_count",
             "state_topic": f"{self.topic_prefix}/sms_counter/state",
             "value_template": "{{ value_json.count }}",
             "icon": "mdi:counter",
@@ -835,7 +968,7 @@ class MQTTPublisher:
         # Reset counter button
         reset_counter_button_config = {
             "name": "Reset SMS Counter",
-            "unique_id": "sms_gateway_reset_counter",
+            "unique_id": f"{self.device_id}_reset_counter",
             "command_topic": f"{self.topic_prefix}/reset_counter_button",
             "payload_press": "PRESS",
             "icon": "mdi:restart",
@@ -846,7 +979,7 @@ class MQTTPublisher:
         # Delete all SMS button
         delete_all_sms_button_config = {
             "name": "Delete All SMS",
-            "unique_id": "sms_gateway_delete_all_sms",
+            "unique_id": f"{self.device_id}_delete_all_sms",
             "command_topic": f"{self.topic_prefix}/delete_all_sms_button",
             "payload_press": "PRESS",
             "icon": "mdi:delete-sweep",
@@ -857,7 +990,7 @@ class MQTTPublisher:
         # Modem IMEI sensor
         modem_imei_config = {
             "name": "Modem IMEI",
-            "unique_id": "sms_gateway_modem_imei",
+            "unique_id": f"{self.device_id}_modem_imei",
             "state_topic": f"{self.topic_prefix}/modem_info/state",
             "value_template": "{{ value_json.IMEI }}",
             "icon": "mdi:identifier",
@@ -868,7 +1001,7 @@ class MQTTPublisher:
         # Modem Model sensor
         modem_model_config = {
             "name": "Modem Model",
-            "unique_id": "sms_gateway_modem_model",
+            "unique_id": f"{self.device_id}_modem_model",
             "state_topic": f"{self.topic_prefix}/modem_info/state",
             "value_template": "{{ value_json.Manufacturer }} {{ value_json.Model }}",
             "icon": "mdi:cellphone",
@@ -879,7 +1012,7 @@ class MQTTPublisher:
         # SIM IMSI sensor
         sim_imsi_config = {
             "name": "SIM IMSI",
-            "unique_id": "sms_gateway_sim_imsi",
+            "unique_id": f"{self.device_id}_sim_imsi",
             "state_topic": f"{self.topic_prefix}/sim_info/state",
             "value_template": "{{ value_json.IMSI }}",
             "icon": "mdi:sim",
@@ -890,7 +1023,7 @@ class MQTTPublisher:
         # SMS Capacity sensor
         sms_capacity_config = {
             "name": "SMS Storage Used",
-            "unique_id": "sms_gateway_sms_capacity",
+            "unique_id": f"{self.device_id}_sms_capacity",
             "state_topic": f"{self.topic_prefix}/sms_capacity/state",
             "value_template": "{{ value_json.SIMUsed }}",
             "json_attributes_topic": f"{self.topic_prefix}/sms_capacity/state",
@@ -900,25 +1033,56 @@ class MQTTPublisher:
             **AVAILABILITY_CONFIG
         }
 
+        # Call monitoring sensors - only if enabled
+        incoming_call_config = None
+        missed_call_config = None
+        if self.config.get('missed_calls_monitoring_enabled', False):
+            # Binary sensor - Incoming Call (real-time ringing detection)
+            incoming_call_config = {
+                "name": "Incoming Call",
+                "unique_id": f"{self.device_id}_incoming_call",
+                "state_topic": f"{self.topic_prefix}/incoming_call/state",
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "value_template": "{{ value_json.state }}",
+                "json_attributes_topic": f"{self.topic_prefix}/incoming_call/state",
+                "icon": "mdi:phone-ring",
+                "device_class": "sound",
+                "device": DEVICE_CONFIG,
+                **AVAILABILITY_CONFIG
+            }
+
+            # Sensor - Last Missed Call (with extended attributes)
+            missed_call_config = {
+                "name": "Last Missed Call",
+                "unique_id": f"{self.device_id}_last_missed_call",
+                "state_topic": f"{self.topic_prefix}/missed_call/state",
+                "value_template": "{{ value_json.Number }}",
+                "json_attributes_topic": f"{self.topic_prefix}/missed_call/state",
+                "icon": "mdi:phone-missed",
+                "device": DEVICE_CONFIG,
+                **AVAILABILITY_CONFIG
+            }
+
         # Publish discovery configs
         discoveries = [
-            ("homeassistant/sensor/sms_gateway_signal/config", signal_config),
-            ("homeassistant/sensor/sms_gateway_network/config", network_config),
-            ("homeassistant/sensor/sms_gateway_last_sms/config", sms_config),
-            ("homeassistant/sensor/sms_gateway_send_status/config", send_status_config),
-            ("homeassistant/sensor/sms_gateway_delete_status/config", delete_status_config),
-            ("homeassistant/sensor/sms_gateway_modem_status/config", device_status_config),
-            ("homeassistant/sensor/sms_gateway_sent_count/config", sms_counter_config),
-            ("homeassistant/sensor/sms_gateway_modem_imei/config", modem_imei_config),
-            ("homeassistant/sensor/sms_gateway_modem_model/config", modem_model_config),
-            ("homeassistant/sensor/sms_gateway_sim_imsi/config", sim_imsi_config),
-            ("homeassistant/sensor/sms_gateway_sms_capacity/config", sms_capacity_config),
-            ("homeassistant/button/sms_gateway_send_button/config", button_config),
-            ("homeassistant/button/sms_gateway_send_flash_button/config", flash_button_config),
-            ("homeassistant/button/sms_gateway_reset_counter/config", reset_counter_button_config),
-            ("homeassistant/button/sms_gateway_delete_all_sms/config", delete_all_sms_button_config),
-            ("homeassistant/text/sms_gateway_phone_number/config", phone_text_config),
-            ("homeassistant/text/sms_gateway_message_text/config", message_text_config)
+            (f"homeassistant/sensor/{self.device_id}_signal/config", signal_config),
+            (f"homeassistant/sensor/{self.device_id}_network/config", network_config),
+            (f"homeassistant/sensor/{self.device_id}_last_sms/config", sms_config),
+            (f"homeassistant/sensor/{self.device_id}_send_status/config", send_status_config),
+            (f"homeassistant/sensor/{self.device_id}_delete_status/config", delete_status_config),
+            (f"homeassistant/sensor/{self.device_id}_modem_status/config", device_status_config),
+            (f"homeassistant/sensor/{self.device_id}_sent_count/config", sms_counter_config),
+            (f"homeassistant/sensor/{self.device_id}_modem_imei/config", modem_imei_config),
+            (f"homeassistant/sensor/{self.device_id}_modem_model/config", modem_model_config),
+            (f"homeassistant/sensor/{self.device_id}_sim_imsi/config", sim_imsi_config),
+            (f"homeassistant/sensor/{self.device_id}_sms_capacity/config", sms_capacity_config),
+            (f"homeassistant/button/{self.device_id}_send_button/config", button_config),
+            (f"homeassistant/button/{self.device_id}_send_flash_button/config", flash_button_config),
+            (f"homeassistant/button/{self.device_id}_reset_counter/config", reset_counter_button_config),
+            (f"homeassistant/button/{self.device_id}_delete_all_sms/config", delete_all_sms_button_config),
+            (f"homeassistant/text/{self.device_id}_phone_number/config", phone_text_config),
+            (f"homeassistant/text/{self.device_id}_message_text/config", message_text_config)
         ]
 
         # Add cost sensor only if cost is configured (> 0)
@@ -926,7 +1090,7 @@ class MQTTPublisher:
             sms_cost_currency = self.config.get('sms_cost_currency', 'CZK')
             sms_cost_config = {
                 "name": "SMS Total Cost",
-                "unique_id": "sms_gateway_total_cost",
+                "unique_id": f"{self.device_id}_total_cost",
                 "state_topic": f"{self.topic_prefix}/sms_counter/state",
                 "value_template": "{{ value_json.cost }}",
                 "icon": "mdi:cash",
@@ -935,8 +1099,42 @@ class MQTTPublisher:
                 "device": DEVICE_CONFIG,
                 **AVAILABILITY_CONFIG
             }
-            discoveries.append(("homeassistant/sensor/sms_gateway_total_cost/config", sms_cost_config))
-        
+            discoveries.append((f"homeassistant/sensor/{self.device_id}_total_cost/config", sms_cost_config))
+
+        # Add call monitoring sensors if enabled
+        if incoming_call_config:
+            discoveries.append((f"homeassistant/binary_sensor/{self.device_id}_incoming_call/config", incoming_call_config))
+        if missed_call_config:
+            discoveries.append((f"homeassistant/sensor/{self.device_id}_last_missed_call/config", missed_call_config))
+
+        # Voice call entities (if enabled)
+        if self.config.get('voice_call_enabled', False):
+            # Dial button
+            dial_button_config = {
+                "name": "Dial Call",
+                "unique_id": f"{self.device_id}_dial_call",
+                "command_topic": f"{self.topic_prefix}/dial_button",
+                "icon": "mdi:phone-outgoing",
+                "device": DEVICE_CONFIG,
+                **AVAILABILITY_CONFIG
+            }
+            discoveries.append((f"homeassistant/button/{self.device_id}_dial_call/config", dial_button_config))
+
+            # Outgoing call binary sensor
+            outgoing_call_config = {
+                "name": "Outgoing Call",
+                "unique_id": f"{self.device_id}_outgoing_call",
+                "state_topic": f"{self.topic_prefix}/outgoing_call/state",
+                "payload_on": "ON",
+                "payload_off": "OFF",
+                "value_template": "{{ value_json.state }}",
+                "json_attributes_topic": f"{self.topic_prefix}/outgoing_call/state",
+                "icon": "mdi:phone-outgoing",
+                "device": DEVICE_CONFIG,
+                **AVAILABILITY_CONFIG
+            }
+            discoveries.append((f"homeassistant/binary_sensor/{self.device_id}_outgoing_call/config", outgoing_call_config))
+
         for topic, config in discoveries:
             self.client.publish(topic, json.dumps(config), retain=True, qos=1)
         
@@ -974,11 +1172,20 @@ class MQTTPublisher:
             
         # Add timestamp
         sms_data['timestamp'] = time.strftime('%Y-%m-%d %H:%M:%S')
-        
+
+        # Sanitizace: případné bytes hodnoty (nedekódovatelný text/číslo) by
+        # shodily json.dumps ("Object of type bytes is not JSON serializable").
+        safe_data = {
+            k: (v.decode('utf-8', errors='replace') if isinstance(v, bytes) else v)
+            for k, v in sms_data.items()
+        }
+
+        # retain=True: poslední přijatá SMS přežije restart HA / znovupřipojení,
+        # takže senzor nepřepadne na "unknown" a zpráva zůstane viditelná.
         topic = f"{self.topic_prefix}/sms/state"
-        self.client.publish(topic, json.dumps(sms_data), qos=1)
-        
-        logger.info(f"📡 Published SMS to MQTT: {sms_data.get('Number', 'Unknown')} -> {sms_data.get('Text', '')}")
+        self.client.publish(topic, json.dumps(safe_data), qos=1, retain=True)
+
+        logger.info(f"📡 Published SMS to MQTT: {safe_data.get('Number', 'Unknown')} -> {safe_data.get('Text', '')}")
     
     def publish_device_status(self):
         """Publish USB device connectivity status"""
@@ -1054,37 +1261,503 @@ class MQTTPublisher:
         topic = f"{self.topic_prefix}/sms_capacity/state"
         self.client.publish(topic, json.dumps(capacity_data), retain=True)
         logger.info(f"📡 Published SMS capacity to MQTT: {capacity_data.get('SIMUsed', 0)}/{capacity_data.get('SIMSize', 0)}")
-        
+
+    def publish_missed_call(self, call_data: dict):
+        """Publish missed call to MQTT (real-time callback verze)."""
+        if not self.connected:
+            return
+
+        # Přidej processed_at pokud chybí
+        if 'processed_at' not in call_data:
+            call_data['processed_at'] = datetime.now().isoformat()
+
+        topic = f"{self.topic_prefix}/missed_call/state"
+        self.client.publish(topic, json.dumps(call_data), retain=True)
+
+        logger.info(f"📞 Missed call from {call_data.get('Number', 'Unknown')} "
+                    f"(rang {call_data.get('ring_duration_seconds', '?')}s, "
+                    f"{call_data.get('ring_count', '?')} rings)")
+
+    def publish_incoming_call_state(self, is_ringing: bool):
+        """Publikuje stav příchozího hovoru (real-time binary sensor)."""
+        if not self.connected:
+            return
+
+        if is_ringing and self.call_queue:
+            # Použij poslední hovor ve frontě pro zobrazení
+            last_call = self.call_queue[-1]
+            payload = {
+                "state": "ON",
+                "Number": last_call['number'],
+                "ring_start": last_call['ring_start'].isoformat(),
+                "ring_count": last_call['ring_count'],
+                "queue_size": len(self.call_queue)
+            }
+        else:
+            payload = {"state": "OFF"}
+
+        topic = f"{self.topic_prefix}/incoming_call/state"
+        self.client.publish(topic, json.dumps(payload), retain=False)
+
+    def publish_outgoing_call_state(self, is_active: bool, number: str = None):
+        """Publish outgoing call state to MQTT"""
+        if not self.connected:
+            return
+
+        if is_active:
+            payload = {"state": "ON", "Number": number or ""}
+            self._outgoing_call_active = True
+        else:
+            payload = {"state": "OFF"}
+            self._outgoing_call_active = False
+
+        topic = f"{self.topic_prefix}/outgoing_call/state"
+        self.client.publish(topic, json.dumps(payload), retain=False)
+        logger.info(f"📞 Outgoing call state: {'ON' if is_active else 'OFF'}" + (f" ({number})" if number else ""))
+
+
+    def _handle_gammu_event(self, sm, event_type, data):
+        """
+        Unified Gammu callback pro všechny události (hovory i SMS).
+        Volá se z ReadDevice() loop.
+        """
+        try:
+            logger.debug(f"📱 Gammu event: type={event_type}, data={data}")
+
+            if event_type == 'Call':
+                self._handle_call_event(data)
+            elif event_type == 'SMS':
+                self._handle_sms_event(data)
+            else:
+                logger.debug(f"📱 Unknown event type: {event_type}")
+
+        except Exception as e:
+            logger.error(f"Error in Gammu callback: {e}")
+
+    def _handle_call_event(self, call_data):
+        """Zpracování události hovoru s podporou fronty až 5 hovorů."""
+        status = call_data.get('Status', '')
+        number = call_data.get('Number', '') or 'Unknown'
+
+        logger.debug(f"📞 Call event: status={status}, number={number}")
+
+        if status == 'IncomingCall':
+            # Najdi existující hovor podle čísla
+            existing = next((c for c in self.call_queue if c['number'] == number), None)
+
+            if existing:
+                # Pokračující zvonění (RING) - inkrementuj ring_count
+                existing['ring_count'] += 1
+                logger.info(f"📞 RING #{existing['ring_count']} from {number}")
+            else:
+                # Nový hovor
+                if len(self.call_queue) >= self.MAX_CALL_QUEUE_SIZE:
+                    # Fronta plná - publikuj nejstarší jako missed
+                    oldest = self.call_queue.pop(0)
+                    self._publish_missed_call_from_queue(oldest, queue_full=True)
+                    logger.info(f"📞 Queue full, evicting oldest call from {oldest['number']}")
+
+                new_call = {
+                    'number': number,
+                    'ring_start': datetime.now(),
+                    'ring_count': 1
+                }
+                self.call_queue.append(new_call)
+                logger.info(f"📞 Incoming call from {number}")
+                logger.info(f"📞 RING #1 from {number}")
+
+            # Restart timer při KAŽDÉM RING eventu (prodlouží timeout)
+            self._start_call_auto_reset_timer()
+            self.publish_incoming_call_state(True)
+
+        elif status in ['CallRemoteEnd', 'CallLocalEnd']:
+            # Hovor ukončen - najdi hovor podle čísla
+            call = None
+
+            if number and number != 'Unknown':
+                # Máme číslo - hledej podle něj
+                call = next((c for c in self.call_queue if c['number'] == number), None)
+
+            if not call and len(self.call_queue) == 1:
+                # Nemáme číslo (nebo nenalezeno), ale je jen 1 hovor - odeber ho
+                call = self.call_queue[0]
+                logger.info(f"📞 CallEnd without number, removing only queued call from {call['number']}")
+            elif not call and len(self.call_queue) > 1:
+                # Více hovorů a nevíme který - loguj warning
+                logger.warning(f"📞 CallEnd without number, but {len(self.call_queue)} calls in queue - cannot determine which to remove")
+
+            if call:
+                self.call_queue.remove(call)
+                self._publish_missed_call_from_queue(call)
+                logger.info(f"📞 Call ended from {call['number']} (rang {call['ring_count']} times)")
+
+            # Pokud je fronta prázdná, resetuj stav
+            if not self.call_queue:
+                self._cancel_call_auto_reset_timer()
+                self.publish_incoming_call_state(False)
+            else:
+                # Aktualizuj binary sensor na poslední číslo ve frontě
+                self.publish_incoming_call_state(True)
+
+        elif status == 'CallStart':
+            # Hovor byl přijat - není zmeškaný, odeber z fronty
+            call = None
+
+            if number and number != 'Unknown':
+                call = next((c for c in self.call_queue if c['number'] == number), None)
+
+            if not call and len(self.call_queue) == 1:
+                # Nemáme číslo, ale je jen 1 hovor - odeber ho
+                call = self.call_queue[0]
+                logger.info(f"📞 CallStart without number, removing only queued call from {call['number']}")
+
+            if call:
+                self.call_queue.remove(call)
+                logger.info(f"📞 Call answered from {call['number']} (not missed)")
+
+            if not self.call_queue:
+                self._cancel_call_auto_reset_timer()
+                self.publish_incoming_call_state(False)
+            else:
+                self.publish_incoming_call_state(True)
+
+    def _publish_missed_call_from_queue(self, call: dict, queue_full: bool = False, auto_reset: bool = False):
+        """Publikuj zmeškaný hovor z fronty."""
+        ring_end = datetime.now()
+        duration = (ring_end - call['ring_start']).total_seconds()
+
+        missed_data = {
+            'Number': call['number'],
+            'ring_start': call['ring_start'].isoformat(),
+            'ring_end': ring_end.isoformat(),
+            'ring_duration_seconds': int(duration),
+            'ring_count': call['ring_count']
+        }
+
+        if queue_full:
+            missed_data['queue_full'] = True
+        if auto_reset:
+            missed_data['auto_reset'] = True
+
+        self.publish_missed_call(missed_data)
+
+    def _start_call_auto_reset_timer(self):
+        """Start timer to auto-reset incoming call state (fallback for modems that don't send CallEnd events)."""
+        self._cancel_call_auto_reset_timer()
+
+        timeout = self.config.get('incoming_call_auto_reset_seconds', 60)
+        logger.debug(f"📞 Starting call auto-reset timer: {timeout}s")
+
+        self._call_auto_reset_timer = threading.Timer(
+            timeout,
+            self._auto_reset_incoming_call
+        )
+        self._call_auto_reset_timer.start()
+
+    def _cancel_call_auto_reset_timer(self):
+        """Cancel the auto-reset timer if running."""
+        if self._call_auto_reset_timer:
+            self._call_auto_reset_timer.cancel()
+            self._call_auto_reset_timer = None
+
+    def _auto_reset_incoming_call(self):
+        """Auto-reset: publikuj všechny hovory ve frontě jako missed."""
+        if self.call_queue:
+            logger.info(f"📞 Auto-reset timeout - publishing {len(self.call_queue)} missed call(s)")
+
+            for call in self.call_queue:
+                self._publish_missed_call_from_queue(call, auto_reset=True)
+
+            self.call_queue = []
+
+        self.publish_incoming_call_state(False)
+        self._call_auto_reset_timer = None
+
+    def _handle_sms_event(self, sms_data):
+        """Zpracování události SMS - trigger pro rychlejší zpracování."""
+        # Respektuj sms_monitoring_enabled nastavení
+        if not self.config.get('sms_monitoring_enabled', True):
+            logger.debug("📨 SMS event ignored (sms_monitoring_enabled=false)")
+            return
+
+        logger.info(f"📨 SMS event triggered - scheduling processing in 3s (data: {sms_data})")
+
+        # Zruš předchozí timer pokud existuje (debounce pro dlouhé SMS)
+        if self._sms_callback_timer:
+            self._sms_callback_timer.cancel()
+
+        # Nastav flag a spusť timer (3s debounce pro multi-part SMS)
+        self._sms_callback_pending = True
+        self._sms_callback_timer = threading.Timer(
+            3.0,
+            self._process_sms_from_callback
+        )
+        self._sms_callback_timer.start()
+
+    def _process_sms_from_callback(self):
+        """Zpracování SMS po debounce - přímo zpracuje nové SMS."""
+        if not self._sms_callback_pending:
+            return
+
+        self._sms_callback_pending = False
+        logger.info("📨 Processing SMS from callback (after 3s debounce)")
+
+        if not self.gammu_machine:
+            logger.warning("Gammu machine not available for SMS processing")
+            return
+
+        try:
+            from support import retrieveAllSms, deleteSms
+
+            # Získej všechny SMS
+            all_sms = self.track_gammu_operation("retrieveAllSms", retrieveAllSms, self.gammu_machine)
+
+            if not all_sms:
+                logger.debug("No SMS to process")
+                return
+
+            auto_delete = self.config.get('auto_delete_read_sms', False)
+            processed_count = 0
+
+            # Zpracuj všechny nepřečtené SMS
+            for sms in all_sms:
+                if sms.get('State') == 'UnRead':
+                    # Přeskoč nekompletní multipart SMS - počkáme, až dorazí
+                    # všechny části (zpracují se v některém z dalších cyklů).
+                    if not sms.get('Complete', True):
+                        logger.info(
+                            f"⏳ Incomplete multipart SMS from {sms.get('Number', 'Unknown')} "
+                            f"({sms.get('PartsReceived')}/{sms.get('PartsExpected')} parts) - waiting for the rest"
+                        )
+                        continue
+
+                    sms_copy = sms.copy()
+                    sms_copy.pop("Locations", None)
+
+                    # Publikuj do MQTT
+                    self.publish_sms_received(sms_copy)
+                    processed_count += 1
+
+                    # Auto-delete pokud povoleno
+                    if auto_delete:
+                        self._auto_delete_sms(sms)
+
+            if processed_count > 0:
+                logger.info(f"📨 Callback processed {processed_count} new SMS")
+                self.sms_processed.update()
+
+                # Aktualizuj kapacitu
+                try:
+                    capacity = self.track_gammu_operation("GetSMSStatus", self.gammu_machine.GetSMSStatus)
+                    self.publish_sms_capacity(capacity)
+                except Exception as e:
+                    logger.warning(f"Could not update SMS capacity: {e}")
+
+        except Exception as e:
+            logger.error(f"Error processing SMS from callback: {e}")
+
+    def _auto_delete_sms(self, sms):
+        """Smaže (auto-delete) přečtenou SMS.
+
+        Pokud je nastaven `sms_delete_delay_seconds` > 0, smazání se naplánuje
+        s odkladem - dá tak automatizacím / uživateli čas zprávu zpracovat a
+        slouží jako pojistka u pomalu přicházejících multipart SMS. Volá se až
+        po ověření, že je zpráva kompletní (Complete=True).
+
+        Vrací True, pokud bylo smazání provedeno nebo naplánováno.
+        """
+        try:
+            delay = int(self.config.get('sms_delete_delay_seconds', 0) or 0)
+        except (TypeError, ValueError):
+            delay = 0
+
+        number = sms.get('Number', 'Unknown')
+
+        if delay > 0:
+            date_str = str(sms.get('Date', ''))
+            threading.Timer(delay, self._delayed_delete_sms, [number, date_str]).start()
+            logger.info(f"🕒 SMS from {number} scheduled for deletion in {delay}s")
+            return True
+
+        from support import deleteSms
+        try:
+            self.track_gammu_operation("deleteSms", deleteSms, self.gammu_machine, sms)
+            logger.info(f"🗑️ Auto-deleted SMS from {number}")
+            return True
+        except Exception as e:
+            logger.error(f"Error auto-deleting SMS: {e}")
+            return False
+
+    def _delayed_delete_sms(self, number, date_str):
+        """Provede odložené smazání SMS po uplynutí `sms_delete_delay_seconds`.
+
+        Místo držení (možná již neplatných) lokací znovu načte zprávy z modemu
+        a smaže jen tu, která stále odpovídá číslu i datu a je kompletní -
+        ochrana proti přečíslování lokací mezi naplánováním a smazáním.
+        """
+        if not self.gammu_machine:
+            return
+        from support import retrieveAllSms, deleteSms
+        try:
+            all_sms = self.track_gammu_operation("retrieveAllSms", retrieveAllSms, self.gammu_machine)
+            for sms in all_sms or []:
+                if (sms.get('Number') == number
+                        and str(sms.get('Date', '')) == date_str
+                        and sms.get('Complete', True)):
+                    self.track_gammu_operation("deleteSms", deleteSms, self.gammu_machine, sms)
+                    logger.info(f"🗑️ Auto-deleted SMS from {number} (after delay)")
+                    return
+            logger.debug(f"Delayed delete: SMS from {number} ({date_str}) no longer present, skipping")
+        except Exception as e:
+            logger.error(f"Error in delayed SMS delete: {e}")
+
+    def start_callback_monitoring(self, gammu_machine):
+        """
+        Spustí real-time monitoring hovorů a SMS přes Gammu callbacky.
+
+        Args:
+            gammu_machine: Gammu state machine
+
+        Returns:
+            True pokud aspoň jeden callback funguje, False jinak
+        """
+        from support import setupCallbacks
+
+        # Setup unified callbacku pro hovory i SMS
+        result = setupCallbacks(
+            gammu_machine,
+            self._handle_gammu_event
+        )
+
+        self.call_monitoring_enabled = result['calls']
+        self.sms_callback_enabled = result['sms']
+
+        if result['calls']:
+            logger.info("📞 Call callback: ENABLED (real-time detection)")
+            # Publikuj iniciální OFF stav pro incoming_call
+            self.publish_incoming_call_state(False)
+        else:
+            logger.warning("📞 Call callback: NOT SUPPORTED by modem")
+
+        if result['sms']:
+            logger.info("📨 SMS callback: ENABLED (faster delivery)")
+        else:
+            logger.info("📨 SMS callback: NOT SUPPORTED (using polling only)")
+
+        # Spusť ReadDevice loop jen pokud aspoň jeden callback funguje
+        if result['calls'] or result['sms']:
+            def _read_device_loop():
+                logger.info("🔄 ReadDevice loop started (1s interval)")
+                while self.connected and not self.disconnecting:
+                    try:
+                        if self._is_call_active():
+                            time.sleep(1)
+                            continue
+                        with self.gammu_lock:
+                            # Re-check inside lock to prevent race with DialVoice
+                            if self._is_call_active():
+                                continue
+                            gammu_machine.ReadDevice()
+                    except Exception as e:
+                        logger.debug(f"ReadDevice: {e}")
+
+                    # Post-call recovery: re-initialize gammu connection to clear modem state
+                    if self._post_call_recovery_until and time.time() >= self._post_call_recovery_until:
+                        self._post_call_recovery_until = None
+                        logger.info("🔄 Post-call recovery: re-initializing modem connection...")
+                        try:
+                            with self.gammu_lock:
+                                gammu_machine.Terminate()
+                                time.sleep(2)
+                                gammu_machine.Init()
+                            logger.info("✅ Modem connection re-initialized")
+                            # Re-register callbacks (lost after Terminate+Init)
+                            from support import setupCallbacks
+                            result = setupCallbacks(gammu_machine, self._handle_gammu_event)
+                            if result.get('calls'):
+                                logger.info("📞 Call callback: RE-ENABLED after recovery")
+                            if result.get('sms'):
+                                logger.info("📨 SMS callback: RE-ENABLED after recovery")
+                            logger.info("✅ Post-call recovery complete, resuming normal operations")
+                        except Exception as e:
+                            logger.warning(f"⚠️ Post-call recovery failed: {e}, resuming anyway")
+
+                    time.sleep(1)
+                logger.info("🔄 ReadDevice loop stopped")
+
+            self._read_device_thread = threading.Thread(
+                target=_read_device_loop,
+                daemon=True,
+                name="ReadDeviceLoop"
+            )
+            self._read_device_thread.start()
+            return True
+
+        return False
+
+    def _is_call_active(self):
+        """Check if outgoing call is still in progress"""
+        if self._call_active_until and time.time() < self._call_active_until:
+            return True
+        if self._call_active_until and time.time() >= self._call_active_until:
+            # Call timeout expired, start post-call recovery
+            self._call_active_until = None
+            self._outgoing_call_active = False
+            self.publish_outgoing_call_state(False)
+            # Recovery: 5s for ReadDevice to flush NO CARRIER URC from modem buffer
+            self._post_call_recovery_until = time.time() + 5
+            logger.info("📞 Call period ended, starting 5s post-call recovery...")
+        return False
+
+    def _is_post_call_recovery(self):
+        """Check if post-call recovery is in progress (only ReadDevice allowed)"""
+        if self._post_call_recovery_until and time.time() < self._post_call_recovery_until:
+            return True
+        if self._post_call_recovery_until and time.time() >= self._post_call_recovery_until:
+            self._post_call_recovery_until = None
+        return False
+
     def track_gammu_operation(self, operation_name, gammu_function, *args, **kwargs):
         """Execute gammu operation with connectivity tracking, thread safety, and Python-level timeout"""
+        # Skip operations during active outgoing call (modem is busy)
+        if self._is_call_active() and operation_name != "DialVoice":
+            logger.debug(f"⏸️ Skipping '{operation_name}' - outgoing call in progress")
+            raise Exception("Outgoing call in progress, modem busy")
+        # Skip operations during post-call recovery (ReadDevice flushes NO CARRIER URC)
+        if self._is_post_call_recovery() and operation_name != "Reset":
+            logger.debug(f"⏸️ Skipping '{operation_name}' - post-call recovery in progress")
+            raise Exception("Post-call recovery in progress, modem busy")
         # Use lock to serialize all Gammu operations (prevent race conditions on serial port)
         with self.gammu_lock:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(gammu_function, *args, **kwargs)
-                try:
-                    # Python-level timeout (60s) as second defense layer
-                    # Primary defense is Gammu commtimeout=40s in config
-                    result = future.result(timeout=60)
-                    self.device_tracker.record_success()
-                    self.publish_device_status()
-                    logger.debug(f"✅ Gammu operation '{operation_name}' succeeded")
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            future = executor.submit(gammu_function, *args, **kwargs)
+            try:
+                # Python-level timeout (60s) as second defense layer
+                # Primary defense is Gammu commtimeout=40s in config
+                result = future.result(timeout=60)
+                self.device_tracker.record_success()
+                self.publish_device_status()
+                logger.debug(f"✅ Gammu operation '{operation_name}' succeeded")
 
-                    # Small delay after each operation to let modem "breathe"
-                    # Prevents buffer overflow on modems like Huawei E1750
-                    time.sleep(0.3)
+                # Small delay after each operation to let modem "breathe"
+                # Prevents buffer overflow on modems like Huawei E1750
+                time.sleep(0.3)
 
-                    return result
-                except concurrent.futures.TimeoutError:
-                    # Operation timed out at Python level
-                    self.device_tracker.record_failure(f"{operation_name}: Python timeout (60s)")
-                    self.publish_device_status()
-                    logger.error(f"⏱️ Gammu operation '{operation_name}' timed out after 60s")
-                    raise TimeoutError(f"Gammu operation '{operation_name}' timed out after 60s")
-                except Exception as e:
-                    # All other errors (including Gammu commtimeout errors)
-                    self.device_tracker.record_failure(f"{operation_name}: {str(e)}")
-                    self.publish_device_status()
-                    raise
+                return result
+            except concurrent.futures.TimeoutError:
+                # Operation timed out at Python level
+                self.device_tracker.record_failure(f"{operation_name}: Python timeout (60s)")
+                self.publish_device_status()
+                logger.error(f"⏱️ Gammu operation '{operation_name}' timed out after 60s")
+                raise TimeoutError(f"Gammu operation '{operation_name}' timed out after 60s")
+            except Exception as e:
+                # All other errors (including Gammu commtimeout errors)
+                self.device_tracker.record_failure(f"{operation_name}: {str(e)}")
+                self.publish_device_status()
+                raise
+            finally:
+                # Never wait for stuck threads — prevents deadlock when Gammu hangs on serial port
+                executor.shutdown(wait=False)
     
     def _publish_initial_states(self):
         """Publish initial sensor states on startup"""
@@ -1224,6 +1897,8 @@ class MQTTPublisher:
                 # Check for new SMS with connectivity tracking (this will handle errors and update status)
                 try:
                     all_sms = self.track_gammu_operation("retrieveAllSms", retrieveAllSms, gammu_machine)
+                    if not all_sms:
+                        all_sms = []
                     current_count = len(all_sms)
                     logger.info(f"✅ SMS monitoring cycle OK: {current_count} messages on SIM")
                 except Exception as e:
@@ -1248,21 +1923,28 @@ class MQTTPublisher:
 
                 try:
                     if first_run:
-                        # On first run, publish only unread SMS
+                        # On first run, publish only unread SMS newer than last processed time
                         logger.info(f"📱 Initial SMS check: {current_count} total SMS on SIM")
                         unread_count = 0
+                        skipped_count = 0
                         for sms in all_sms:
                             if sms.get('State') == 'UnRead':
-                                sms_copy = sms.copy()
-                                sms_copy.pop("Locations", None)
-                                self.publish_sms_received(sms_copy)
-                                unread_count += 1
+                                if self.sms_processed.is_new_sms(sms):
+                                    sms_copy = sms.copy()
+                                    sms_copy.pop("Locations", None)
+                                    self.publish_sms_received(sms_copy)
+                                    unread_count += 1
+                                else:
+                                    skipped_count += 1
 
                         if unread_count > 0:
                             logger.info(f"📱 Published {unread_count} unread SMS messages")
-                        else:
+                        if skipped_count > 0:
+                            logger.info(f"📱 Skipped {skipped_count} already processed SMS")
+                        if unread_count == 0 and skipped_count == 0:
                             logger.info(f"📱 No unread SMS messages to publish")
 
+                        self.sms_processed.update()
                         last_sms_count = current_count
                         first_run = False
                     elif current_count > last_sms_count:
@@ -1275,6 +1957,15 @@ class MQTTPublisher:
                         # Process new SMS (from the end, newest first)
                         for i in range(last_sms_count, current_count):
                             if i < len(all_sms):
+                                # Přeskoč nekompletní multipart SMS - počkáme na
+                                # zbylé části (zpracují se v dalším cyklu).
+                                if not all_sms[i].get('Complete', True):
+                                    logger.info(
+                                        f"⏳ Incomplete multipart SMS from {all_sms[i].get('Number', 'Unknown')} "
+                                        f"({all_sms[i].get('PartsReceived')}/{all_sms[i].get('PartsExpected')} parts) - waiting for the rest"
+                                    )
+                                    continue
+
                                 sms = all_sms[i].copy()
                                 sms.pop("Locations", None)
 
@@ -1283,12 +1974,10 @@ class MQTTPublisher:
 
                                 # Auto-delete if enabled and SMS is read
                                 if auto_delete and sms.get('State') in ['Read', 'UnRead']:
-                                    try:
-                                        self.track_gammu_operation("deleteSms", deleteSms, gammu_machine, all_sms[i])
-                                        logger.info(f"🗑️ Auto-deleted SMS from {sms.get('Number', 'Unknown')}")
+                                    if self._auto_delete_sms(all_sms[i]):
                                         deleted_count += 1
-                                    except Exception as e:
-                                        logger.error(f"Error auto-deleting SMS: {e}")
+
+                        self.sms_processed.update()
 
                         # If we auto-deleted any SMS, update capacity and get new count
                         if auto_delete and deleted_count > 0:
@@ -1306,6 +1995,9 @@ class MQTTPublisher:
                 except Exception as e:
                     # Non-gammu errors (like MQTT publishing errors)
                     logger.error(f"Error processing SMS data: {e}")
+
+                # Missed calls jsou nyní monitorovány real-time přes callbacky
+                # (start_callback_monitoring spouští ReadDevice loop)
 
                 time.sleep(check_interval)
         

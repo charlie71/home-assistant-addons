@@ -5,3 +5,4 @@ Flask-HTTPAuth
 pyopenssl
 paho-mqtt
 click
+pyserial

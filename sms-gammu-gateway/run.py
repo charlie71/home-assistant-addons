@@ -12,12 +12,14 @@ import json
 import logging
 import signal
 import sys
-from flask import Flask, request
+from flask import Flask, request, render_template
 from flask_httpauth import HTTPBasicAuth
-from flask_restx import Api, Resource, fields, reqparse
+from flask_restx import Api, Resource, fields, reqparse, apidoc
 
-from support import init_state_machine, retrieveAllSms, deleteSms, encodeSms
+from support import (init_state_machine, retrieveAllSms, deleteSms, encodeSms,
+                     log_device_diagnostics, diagnose_init_failure)
 from mqtt_publisher import MQTTPublisher
+from urc_filter import URCFilterProxy
 from gammu import GSMNetworks
 
 # Configure logging with timestamp
@@ -90,7 +92,6 @@ def load_ha_config():
         return {
             'device_path': '/dev/ttyUSB0',
             'pin': '',
-            'port': 5000,
             'ssl': False,
             'username': 'admin',
             'password': 'password',
@@ -104,7 +105,9 @@ def load_ha_config():
             'sms_check_interval': 60,
             'sms_cost_per_message': 0.0,
             'sms_cost_currency': 'CZK',
-            'auto_delete_read_sms': False
+            'auto_delete_read_sms': False,
+            'modem_baud_rate': '115200',
+            'urc_filter_enabled': True
         }
 
 # Load version and configuration
@@ -112,10 +115,12 @@ VERSION = load_version()
 config = load_ha_config()
 pin = config.get('pin') if config.get('pin') else None
 ssl = config.get('ssl', False)
-port = config.get('port', 5000)
+port = 5000  # Fixed port - must match ingress_port in config.json
 username = config.get('username', 'admin')
 password = config.get('password', 'password')
 device_path = config.get('device_path', '/dev/ttyUSB0')
+baud_rate = str(config.get('modem_baud_rate', '115200'))
+urc_filter_enabled = config.get('urc_filter_enabled', True)
 
 # Initialize MQTT publisher FIRST (before gammu)
 mqtt_publisher = MQTTPublisher(config)
@@ -126,11 +131,38 @@ if mqtt_publisher.connected:
     mqtt_publisher.publish_device_status()
     logging.info("📡 Published initial OFFLINE status on startup")
 
+# Optionally insert URC filter proxy between modem and gammu.
+# Řeší moduly (SIM800/SIM800C), které chrlí "OVER-VOLTAGE WARNNING" apod.
+# a tím zasekávají gammu. Proxy zároveň drží reálný port na pevné rychlosti.
+gammu_device = device_path
+urc_proxy = None
+log_device_diagnostics(device_path)
+if urc_filter_enabled:
+    # Proxy potřebuje konkrétní rychlost reálného portu; pro 'auto' použij 115200.
+    proxy_baud = 115200 if baud_rate == 'auto' else int(baud_rate)
+    try:
+        urc_proxy = URCFilterProxy(device_path, proxy_baud)
+        gammu_device = urc_proxy.start()
+    except Exception as e:
+        logging.error(f"⚠️ URC filter proxy failed to start ({e}); using device directly")
+        urc_proxy = None
+        gammu_device = device_path
+
 # Now initialize gammu state machine (this may fail if modem not connected)
-machine = init_state_machine(pin, device_path)
+try:
+    machine = init_state_machine(pin, gammu_device, baud_rate)
+except Exception as init_error:
+    # Free the physical port (URC proxy holds it) so the diagnosis can talk to it directly
+    if urc_proxy is not None:
+        urc_proxy.stop()
+    diagnose_init_failure(init_error, device_path, baud_rate)
+    raise
 
 # Set gammu machine for MQTT SMS sending
 mqtt_publisher.set_gammu_machine(machine)
+
+# Call monitoring via Gammu callbacks (real-time detection)
+# Bude spuštěno po publikování initial states (níže v main)
 
 # Setup signal handlers for graceful shutdown
 def signal_handler(signum, frame):
@@ -142,6 +174,8 @@ def signal_handler(signum, frame):
     except Exception as e:
         logging.error(f"❌ Error during MQTT disconnect: {e}")
     finally:
+        if urc_proxy is not None:
+            urc_proxy.stop()
         sys.exit(0)
 
 signal.signal(signal.SIGTERM, signal_handler)
@@ -176,13 +210,21 @@ def home():
     <head>
         <title>SMS Gammu Gateway</title>
         <meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
         <style>
-            body { 
+            html {
+                height: 100%;
+                overflow-y: auto;
+            }
+            body {
                 font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
                 margin: 0;
                 padding: 40px 20px;
                 background: #f5f5f5;
                 text-align: center;
+                min-height: 100%;
+                overflow-y: auto;
+                -webkit-overflow-scrolling: touch;
             }
             .container {
                 max-width: 600px;
@@ -237,8 +279,7 @@ def home():
                 Version: {VERSION}
             </div>
             
-            <a href="http://''' + request.host.split(':')[0] + ''':5000/docs/" 
-               class="swagger-link" target="_blank">
+            <a href="docs/" class="swagger-link">
                 📋 Open Swagger API Documentation
             </a>
             
@@ -260,8 +301,15 @@ def home():
     '''
     return Response(html.replace('{VERSION}', VERSION), mimetype='text/html')
 
-# Swagger UI Configuration
-# Put Swagger UI on /docs/ path for direct access via port 5000
+# Swagger UI Configuration - with relative paths for Ingress support
+# Override swagger_static to use relative paths (fixes HA Ingress)
+@apidoc.apidoc.add_app_template_global
+def swagger_static(filename):
+    """Return relative path to swagger static files for Ingress compatibility.
+    Since docs are at /docs/ and assets at /swaggerui/, we need ../swaggerui/
+    """
+    return f"../swaggerui/{filename}"
+
 api = Api(
     app,
     version=VERSION,
@@ -278,6 +326,64 @@ api = Api(
     },
     security='basicAuth'
 )
+
+# Custom documentation view with relative specs_url for Ingress compatibility
+@api.documentation
+def custom_ui():
+    """Custom Swagger UI with relative paths for HA Ingress support."""
+    from flask import render_template_string
+    return render_template_string('''<!DOCTYPE html>
+<html>
+<head>
+    <title>{{ title }}</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <link media="screen" rel="stylesheet" type="text/css" href="../swaggerui/droid-sans.css">
+    <link media="screen" rel="stylesheet" type="text/css" href="../swaggerui/swagger-ui.css">
+    <link rel="icon" type="image/png" href="../swaggerui/favicon-32x32.png" sizes="32x32">
+    <link rel="icon" type="image/png" href="../swaggerui/favicon-16x16.png" sizes="16x16">
+    <style>
+        html { box-sizing: border-box; height: 100%; overflow-y: auto; }
+        *, *:before, *:after { box-sizing: inherit; }
+        body { margin: 0; background: #fafafa; min-height: 100%; overflow-y: auto; -webkit-overflow-scrolling: touch; }
+    </style>
+</head>
+<body>
+    <div id="swagger-ui"></div>
+    <script src="../swaggerui/swagger-ui-bundle.js"></script>
+    <script src="../swaggerui/swagger-ui-standalone-preset.js"></script>
+    <script>
+        window.onload = function() {
+            // Detect if running under Ingress by checking URL path
+            const currentPath = window.location.pathname;
+            const ingressMatch = currentPath.match(/^(\/api\/hassio_ingress\/[^\/]+)/);
+            const ingressBasePath = ingressMatch ? ingressMatch[1] : '';
+
+            const ui = SwaggerUIBundle({
+                url: "../swagger.json",
+                dom_id: '#swagger-ui',
+                presets: [SwaggerUIBundle.presets.apis, SwaggerUIStandalonePreset.slice(1)],
+                plugins: [SwaggerUIBundle.plugins.DownloadUrl],
+                displayOperationId: false,
+                displayRequestDuration: false,
+                docExpansion: "none",
+                // Intercept requests and prepend Ingress path if needed
+                requestInterceptor: function(req) {
+                    if (ingressBasePath && req.url) {
+                        // Check if URL is relative or needs Ingress prefix
+                        const url = new URL(req.url, window.location.origin);
+                        if (!url.pathname.startsWith(ingressBasePath)) {
+                            url.pathname = ingressBasePath + url.pathname;
+                            req.url = url.toString();
+                        }
+                    }
+                    return req;
+                }
+            });
+            window.ui = ui;
+        }
+    </script>
+</body>
+</html>''', title=api.title)
 
 auth = HTTPBasicAuth()
 
@@ -346,15 +452,26 @@ sms_capacity_response = api.model('SMS Capacity', {
     'TemplatesUsed': fields.Integer(description='SMS templates used', example=0)
 })
 
+call_dial_model = api.model('Call Dial', {
+    'number': fields.String(required=True, description='Phone number to dial (international format)', example='+420123456789'),
+    'duration': fields.Integer(required=False, description='Auto-hangup after N seconds (0 = no limit)', default=0, example=30)
+})
+
+call_response = api.model('Call Response', {
+    'status': fields.Integer(description='HTTP status code', example=200),
+    'message': fields.String(description='Call action result', example='Call initiated')
+})
+
 # API Namespaces
 ns_sms = api.namespace('sms', description='SMS operations (requires authentication)')
 ns_status = api.namespace('status', description='Device status and information (public)')
+ns_calls = api.namespace('calls', description='Voice call operations (requires authentication)')
 
 @ns_sms.route('')
 @ns_sms.doc('sms_operations')
 class SmsCollection(Resource):
     @ns_sms.doc('get_all_sms')
-    @ns_sms.marshal_list_with(sms_response)
+    @ns_sms.marshal_list_with(sms_response, code=200)
     @ns_sms.doc(security='basicAuth')
     @auth.login_required
     def get(self):
@@ -365,7 +482,7 @@ class SmsCollection(Resource):
 
     @ns_sms.doc('send_sms')
     @ns_sms.expect(sms_model)
-    @ns_sms.marshal_with(send_response)
+    @ns_sms.marshal_with(send_response, code=200)
     @ns_sms.doc(security='basicAuth')
     @auth.login_required
     def post(self):
@@ -454,7 +571,7 @@ class SmsCollection(Resource):
 @ns_sms.doc('sms_by_id')
 class SmsItem(Resource):
     @ns_sms.doc('get_sms_by_id')
-    @ns_sms.marshal_with(sms_response)
+    @ns_sms.marshal_with(sms_response, code=200)
     @ns_sms.doc(security='basicAuth')
     @auth.login_required
     def get(self, id):
@@ -481,7 +598,7 @@ class SmsItem(Resource):
 @ns_sms.doc('get_and_delete_first_sms')
 class GetSms(Resource):
     @ns_sms.doc('pop_first_sms')
-    @ns_sms.marshal_with(sms_response)
+    @ns_sms.marshal_with(sms_response, code=200)
     @ns_sms.doc(security='basicAuth')
     @auth.login_required
     def get(self):
@@ -603,16 +720,89 @@ class Reset(Resource):
         mqtt_publisher.track_gammu_operation("Reset", machine.Reset, False)
         return {"status": 200, "message": "Reset done"}, 200
 
+@ns_calls.route('/dial')
+@ns_calls.doc('call_operations')
+class CallDial(Resource):
+    @ns_calls.doc('dial_voice_call')
+    @ns_calls.expect(call_dial_model)
+    @ns_calls.marshal_with(call_response)
+    @ns_calls.doc(security='basicAuth')
+    @auth.login_required
+    def post(self):
+        """Dial a voice call to a phone number"""
+        if not config.get('voice_call_enabled', False):
+            return {"status": 403, "message": "Voice calls are disabled in addon configuration"}, 403
+
+        parser = reqparse.RequestParser()
+        parser.add_argument('number', required=True, help='Phone number to dial')
+        parser.add_argument('duration', type=int, required=False, default=0, help='Auto-hangup after N seconds')
+        args = parser.parse_args()
+
+        number = args.get('number', '').strip()
+        duration = args.get('duration', 0) or 0
+
+        if not number:
+            return {"status": 400, "message": "Missing required field: number"}, 400
+
+        try:
+            import time as time_mod
+            call_duration = duration if duration > 0 else 35
+            # Set call active BEFORE DialVoice to prevent ReadDevice race condition
+            mqtt_publisher._call_active_until = time_mod.time() + call_duration + 5
+            mqtt_publisher.track_gammu_operation("DialVoice", machine.DialVoice, number)
+            mqtt_publisher.publish_outgoing_call_state(True, number)
+
+            return {"status": 200, "message": f"Call initiated to {number}, operations paused for {call_duration}s"}, 200
+        except TimeoutError as e:
+            mqtt_publisher._call_active_until = None  # Clear on failure
+            api.abort(503, f"Modem timeout: {str(e)}")
+        except Exception as e:
+            mqtt_publisher._call_active_until = None  # Clear on failure
+            api.abort(503, f"Failed to dial: {str(e)}")
+
+
+@ns_calls.route('/hangup')
+@ns_calls.doc('hangup_operations')
+class CallHangup(Resource):
+    @ns_calls.doc('hangup_call')
+    @ns_calls.marshal_with(call_response)
+    @ns_calls.doc(security='basicAuth')
+    @auth.login_required
+    def post(self):
+        """Hang up all active calls"""
+        if not config.get('voice_call_enabled', False):
+            return {"status": 403, "message": "Voice calls are disabled in addon configuration"}, 403
+
+        return {"status": 200, "message": "Hangup not supported on this modem. Call ends via network timeout (~40s)."}, 200
+
+def get_external_port():
+    """Get the external port from HA Supervisor API."""
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            'http://supervisor/addons/self/info',
+            headers={'Authorization': f'Bearer {os.environ.get("SUPERVISOR_TOKEN", "")}'}
+        )
+        with urllib.request.urlopen(req, timeout=5) as response:
+            data = json.loads(response.read().decode()).get('data', {})
+            network = data.get('network', {})
+            if network and '5000/tcp' in network:
+                return network['5000/tcp']
+    except Exception:
+        pass
+    return 5000  # fallback to internal port
+
 if __name__ == '__main__':
-    print(f"🚀 SMS Gammu Gateway v{VERSION} started successfully!")
-    print(f"📱 Device: {device_path}")
-    print(f"🌐 API available on port {port}")
-    print(f"🏠 Web UI: http://localhost:{port}/")
-    print(f"🔒 SSL: {'Enabled' if ssl else 'Disabled'}")
-    
+    external_port = get_external_port()
+    logging.info(f"🚀 SMS Gammu Gateway v{VERSION} started successfully!")
+    logging.info(f"📱 Device: {device_path}")
+    logging.info(f"🌐 API available on port {external_port}")
+    logging.info(f"🏠 Web UI: http://localhost:{external_port}/")
+    logging.info(f"🔒 SSL: {'Enabled' if ssl else 'Disabled'}")
+
     # MQTT info
     if config.get('mqtt_enabled', False):
-        print(f"📡 MQTT: Enabled -> {config.get('mqtt_host')}:{config.get('mqtt_port')}")
+        logging.info(f"📡 MQTT: Enabled -> {config.get('mqtt_host')}:{config.get('mqtt_port')}")
         
         # Wait a moment for MQTT connection, then publish initial states
         import time
@@ -622,17 +812,18 @@ if __name__ == '__main__':
         # Start periodic MQTT publishing
         mqtt_publisher.publish_status_periodic(machine, interval=300)  # 5 minutes
         
+        # Start call monitoring via Gammu callbacks (real-time detection)
+        if config.get('missed_calls_monitoring_enabled', False):
+            mqtt_publisher.start_callback_monitoring(machine)
+
         # Start SMS monitoring if enabled
         if config.get('sms_monitoring_enabled', True):
             check_interval = config.get('sms_check_interval', 60)
             mqtt_publisher.start_sms_monitoring(machine, check_interval=check_interval)
-            print(f"📱 SMS Monitoring: Enabled (check every {check_interval}s)")
-        else:
-            print(f"📱 SMS Monitoring: Disabled")
     else:
-        print(f"📡 MQTT: Disabled")
-    
-    print(f"✅ Ready to send/receive SMS messages")
+        logging.info(f"📡 MQTT: Disabled")
+
+    logging.info(f"✅ Ready to send/receive SMS messages")
 
     try:
         if ssl:

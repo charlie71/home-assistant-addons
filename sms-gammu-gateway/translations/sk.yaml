@@ -2,12 +2,15 @@ configuration:
   device_path:
     name: Cesta k zariadeniu
     description: Cesta k vášmu GSM modemu (napr. /dev/ttyUSB0)
+  modem_baud_rate:
+    name: Rýchlosť modemu (baud)
+    description: 'Sériová rýchlosť GSM modemu. Číslo ako 115200 rýchlosť zafixuje (odporúčané, rieši zasekávanie SIM800/SIM800C); "auto" nechá gammu rýchlosť zistiť (pôvodné správanie). Ak modem po aktualizácii nenaštartuje, skúste "auto".'
+  urc_filter_enabled:
+    name: Filter URC (varovania modemu)
+    description: Odfiltruje rušivé stavové hlásenia modemu ako "OVER-VOLTAGE WARNNING" (typické pre SIM800), ktoré môžu zaseknúť komunikáciu s gammu. Odporúča sa ponechať zapnuté.
   pin:
     name: PIN SIM karty
     description: PIN kód SIM karty (nechajte prázdne, ak PIN nie je potrebný)
-  port:
-    name: Port API
-    description: Port pre REST API SMS Gateway
   ssl:
     name: Povoliť SSL
     description: Povoliť HTTPS pre zabezpečené pripojenia (vyžaduje SSL certifikáty)
@@ -35,12 +38,15 @@ configuration:
   mqtt_topic_prefix:
     name: MQTT Topic Prefix
     description: Prefix pre MQTT topicy publikovaných správ
+  mqtt_device_id:
+    name: ID zariadenia MQTT
+    description: Jedinečný identifikátor zariadenia pre automatické vyhľadávanie v Home Assistante. Meňte iba pri prevádzke viacerých inštancií na rovnakom MQTT brokeri. Predvolená hodnota zachováva existujúce správanie.
   sms_monitoring_enabled:
     name: Povoliť SMS Monitoring
-    description: Automaticky detekovať a publikovať prichádzajúce SMS správy do MQTT
+    description: Automaticky detekovať a publikovať prichádzajúce SMS správy do MQTT (ovláda callback aj polling)
   sms_check_interval:
     name: Interval Kontroly SMS
-    description: Ako často kontrolovať nové SMS správy (sekundy, 30-300)
+    description: Fallback polling interval pre SMS (sekundy, 30-300). Addon preferuje real-time callback, polling slúži ako záloha pri zlyhaní alebo nepodpore callbacku.
   sms_cost_per_message:
     name: Cena za SMS
     description: Cena za jednu odoslanú SMS správu. Nastavte 0 pre vypnutie sledovania nákladov.
@@ -50,3 +56,15 @@ configuration:
   auto_delete_read_sms:
     name: Automaticky mazať prečítané SMS
     description: Automaticky zmazať SMS správy zo SIM karty po ich prečítaní (uvoľní miesto na SIM)
+  sms_delete_delay_seconds:
+    name: Oneskorenie pred zmazaním SMS
+    description: Počet sekúnd, o ktoré sa odloží automatické zmazanie prečítanej SMS (0 = zmazať ihneď). Poistka, aby automatizácie stihli správu spracovať a pomaly prichádzajúce viacdielne SMS sa stihli zložiť.
+  missed_calls_monitoring_enabled:
+    name: Povoliť monitoring hovorov
+    description: Real-time detekcia hovorov pomocou Gammu callbackov - detekuje prichádzajúce a zmeškané hovory (funguje na SIM800L a väčšine modemov)
+  incoming_call_auto_reset_seconds:
+    name: Auto-reset prichádzajúceho hovoru
+    description: Automaticky resetovať stav prichádzajúceho hovoru po uplynutí tohto času (záloha pre modemy, ktoré neposielajú event ukončenia hovoru). Timer sa reštartuje pri každom RING evente. Nastavte medzi 10-300 sekúnd.
+  voice_call_enabled:
+    name: Hlasové hovory (Experimentálne)
+    description: "Experimentálne: Vytáčanie čísel cez REST API alebo MQTT tlačidlo. Hovor zvoní ~35s, potom sa ukončí cez sieťový timeout. Modem je nedostupný ~2 min po každom hovore (automatická obnova). Zavesenie nie je podporované. Odporúčané iba pre alarm/notifikácie."

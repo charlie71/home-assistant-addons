@@ -2,6 +2,139 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.7.1d] – 2026-09-19 (fork: charlie71)
+
+Fork synchronised with upstream 1.7.1 (SIM800/URC filter, `modem_baud_rate`, voice calls, multipart SMS fix, MQTT device id, Ingress fixes).
+
+### Fork features kept
+* `device_path` selector (`device(subsystem=tty)`) and full `/dev` mapping (RPi5 `/dev/ttyAMA2-4`, ...)
+* Device diagnostics at startup (permissions, owner, major:minor, read-only open test)
+* `sms_cost_currency` default `EUR`
+
+### Changed
+* The unsupported gammu config keys `baudrate`/`init_timeout` (ignored by gammu) were removed; the speed is now set via `modem_baud_rate` (`connection = at<baud>`).
+* The removed upstream option `port` is gone; the port is configured in the Network section.
+
+### Added
+* Startup log of gammu / python-gammu versions, used connection and generated gammu config.
+* `init_state_machine`: max. 3 attempts (5 s pause) for transient errors (`ERR_TIMEOUT`, `ERR_DEVICEREADERROR`), StateMachine released after each failed attempt; no endless retry.
+* On a failed init a diagnosis distinguishes: (1) device missing, (2) device not openable, (3) device opens but modem silent - including a raw `AT` probe at several baud rates that tells you which `modem_baud_rate` works, (4) other gammu error.
+
+## [1.7.1] – 2026-06-16
+
+### Fixed
+
+* **Truncated / incomplete multipart SMS** – Long (concatenated) SMS messages that arrived in several parts could be published — and with auto-delete enabled, deleted — before all parts had arrived, so the user saw only the first part and the rest of the message was lost. Incoming SMS are now checked for completeness (using the multipart `AllParts` info); an incomplete message is left on the modem and processed only once every part has arrived. (#46)
+
+### Added
+
+* **`sms_delete_delay_seconds` option** – Optional delay (0–300 s, `0` = delete immediately) before a read SMS is auto-deleted. Acts as a safety buffer so automations can process the message first and slow-arriving multipart SMS have extra time to fully assemble. (#46)
+
+## [1.7.0] – 2026-06-02
+
+> ⚠️ **Heads-up on the new default:** `modem_baud_rate` now defaults to `115200` instead of auto-detection. This fixes the freezing for most modems out of the box. If your modem does **not** start after this update, set `modem_baud_rate` to `auto` in the addon configuration and restart.
+
+### Added
+
+* **`modem_baud_rate` option** – Lets you set the serial speed of the GSM modem. A fixed value such as `115200` (the new default) prevents gammu's baud-rate auto-detection from hanging on certain modules. Set to `auto` to restore the previous auto-detect behavior, or enter any custom speed (e.g. `9600`, `460800`).
+* **`urc_filter_enabled` option** – Optional serial proxy (enabled by default) that filters out spurious modem status messages such as `OVER-VOLTAGE WARNNING` (typical for SIM800/SIM800C). These unsolicited messages interleave with AT responses and can freeze gammu communication, making the modem appear dead.
+
+### Fixed
+
+* **SIM800/SIM800C freezing / SMS not being read** – Combination of the two options above resolves modems that initialize but then time out on every operation (`GetSignalQuality timed out`). Verified at 100 % success over repeated operations on a real SIM800C, vs. hanging indefinitely before.
+
+
+
+## [1.6.5] – 2026-06-01
+
+### Added
+
+* **`mqtt_device_id` option** – New configuration option for running multiple gateway instances on the same MQTT broker. Default value (`sms_gateway`) preserves existing behavior — no migration needed for current users.
+* **Standalone Docker installation guide** – New README section with step-by-step instructions for running the gateway without Home Assistant Supervisor (e.g. HA Container, plain Docker). Thanks to [@mickeyreg](https://github.com/PavelVe/home-assistant-addons/issues/15#issuecomment-4582397033) for the original guide.
+
+### Fixed
+
+* **MQTT auto-discovery collisions** – Discovery topics, `unique_id`s and HA device identifier are no longer hardcoded. Multiple instances can now coexist on the same MQTT broker without overwriting each other in Home Assistant (#15).
+* **Password fields rendered as plain text** – `pin`, `password` and `mqtt_password` in the addon configuration UI are now masked password inputs (#41).
+
+## [1.6.4] – 2026-03-15
+
+### Fixed
+
+* **MQTT reconnection logic** - Auto-retry if MQTT broker is unavailable at startup, automatic reconnect on disconnect (#37)
+* **SMS re-trigger after restart** - Persist last processed timestamp, skip already published SMS on addon restart/update (#34)
+
+### Added
+
+* **Voice call support (Experimental)** - Dial numbers via REST API (`POST /calls/dial`) and MQTT button (#33)
+  * Call rings ~35s then ends via network timeout (hangup not supported on SIM800C/SIM800L)
+  * All modem operations paused during call to prevent serial port conflicts
+  * Automatic post-call recovery: Gammu re-initialization (`Terminate` + `Init`) to restore modem after `NO CARRIER` URC corrupts internal state (~2 min total downtime)
+  * Outgoing Call binary sensor (ON/OFF) with number attribute
+  * Disabled by default (`voice_call_enabled: false`) — recommended for alarm/notification use only
+
+## [1.6.3] – 2026-02-08
+
+### Fixed
+
+* **Mobile scrolling in Android app** - Added viewport meta tag and improved CSS for proper scrolling in Home Assistant Android/iOS companion apps (#35)
+
+## [1.6.2] – 2026-02-03
+
+### Fixed
+
+* **Incoming call stuck ON** - Auto-reset timeout for modems that don't send CallEnd events
+* **CallEnd without number** - Single queued call now removed correctly even without phone number
+
+### Added
+
+* `incoming_call_auto_reset_seconds` config option (10-300s, default: 60s)
+* Call queue support (up to 5 simultaneous calls)
+* Timer restarts on each RING event
+* New attributes: `queue_size`, `queue_full`, `auto_reset`
+
+## [1.6.1] – 2026-02-03
+
+### Fixed
+
+* **Full Ingress Support** - Swagger UI now works correctly via Home Assistant Ingress
+
+### Changed
+* Removed redundant `port` configuration option - port is managed via Network settings in HA UI
+* Internal port is fixed at 5000 (matches ingress_port), external port configurable in Network section working now correctly.
+
+
+## [1.6.0] – 2026-02-02
+
+📣 ANNOUNCEMENT
+
+Instant SMS delivery and real-time incoming call detection are here! 
+No waiting, no polling — events arrive the moment they happen.
+
+### Added
+
+* Real-time detection of incoming and missed calls via Gammu callbacks (including SIM800L)
+* New binary sensor **Incoming Call** for live ringing state
+* New sensor **Last Missed Call** with missed call details
+* SMS callback support for faster message delivery
+* Dedicated `ReadDevice()` loop (1s interval) for real-time events
+
+### Changed
+
+* Call detection works on modems without call history support
+* SMS can now arrive instantly via callback (polling remains as fallback)
+
+
+## [1.5.7] – 2026-01-12
+
+### Fixed
+
+* Critical fix for MMS notifications causing addon crash
+* Robust SMS decoding with fallback for binary/corrupted messages
+* DELETE ALL endpoint now works even with MMS on SIM card
+* Flask-RESTX marshalling error on unauthenticated requests
+* Authenticated endpoints now return proper 401 response instead of MarshallingError
+
 ## [1.5.6] – 2025-12-17
 
 ### Fixed

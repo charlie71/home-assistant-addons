@@ -2,12 +2,15 @@ configuration:
   device_path:
     name: Percorso dispositivo
     description: Percorso al modem GSM (es. /dev/ttyUSB0)
+  modem_baud_rate:
+    name: Velocità del modem (baud)
+    description: 'Velocità seriale del modem GSM. Un numero come 115200 fissa la velocità (consigliato, risolve il blocco di SIM800/SIM800C); "auto" lascia che gammu la rilevi (comportamento precedente). Se il modem non si avvia dopo l''aggiornamento, prova "auto".'
+  urc_filter_enabled:
+    name: Filtro URC (avvisi del modem)
+    description: Filtra i messaggi di stato spuri del modem come "OVER-VOLTAGE WARNNING" (tipico dei SIM800) che possono bloccare la comunicazione con gammu. Si consiglia di lasciarlo attivo.
   pin:
     name: PIN SIM
     description: Codice PIN della scheda SIM (lasciare vuoto se non richiesto)
-  port:
-    name: Porta API
-    description: Porta per l'API REST del gateway SMS
   ssl:
     name: Abilita SSL
     description: Abilita HTTPS per connessioni sicure (richiede certificati SSL)
@@ -35,12 +38,15 @@ configuration:
   mqtt_topic_prefix:
     name: Prefisso topic MQTT
     description: Prefisso topic MQTT per i messaggi pubblicati
+  mqtt_device_id:
+    name: ID dispositivo MQTT
+    description: Identificatore univoco del dispositivo per l'auto-discovery di Home Assistant. Modificare solo quando si eseguono più istanze sullo stesso broker MQTT. Il valore predefinito mantiene il comportamento esistente.
   sms_monitoring_enabled:
     name: Abilita monitoraggio SMS
-    description: Rileva automaticamente e pubblica messaggi SMS in arrivo su MQTT
+    description: Rileva e pubblica automaticamente SMS in arrivo su MQTT (controlla callback e polling)
   sms_check_interval:
     name: Intervallo controllo SMS
-    description: Frequenza di controllo nuovi messaggi SMS (secondi, 30-300)
+    description: Intervallo di polling di backup per SMS (secondi, 30-300). L'addon preferisce callback in tempo reale, il polling serve come backup in caso di errore o mancato supporto.
   sms_cost_per_message:
     name: Costo per SMS
     description: Costo per SMS inviato. Impostare a 0 per disabilitare il monitoraggio dei costi.
@@ -50,3 +56,15 @@ configuration:
   auto_delete_read_sms:
     name: Elimina automaticamente SMS letti
     description: Elimina automaticamente i messaggi SMS dalla scheda SIM dopo la lettura (libera spazio SIM)
+  sms_delete_delay_seconds:
+    name: Ritardo prima di eliminare SMS
+    description: Secondi di attesa prima di eliminare automaticamente un SMS letto (0 = elimina immediatamente). Ritardo di sicurezza affinché le automazioni elaborino il messaggio e gli SMS multipart lenti arrivino completi.
+  missed_calls_monitoring_enabled:
+    name: Abilita monitoraggio chiamate
+    description: Rilevamento chiamate in tempo reale tramite callback Gammu - rileva chiamate in arrivo e perse (funziona con SIM800L e la maggior parte dei modem)
+  incoming_call_auto_reset_seconds:
+    name: Timeout auto-reset chiamate in arrivo
+    description: Reimposta automaticamente lo stato della chiamata in arrivo dopo questo tempo (fallback per modem che non inviano eventi di fine chiamata). Il timer si riavvia ad ogni evento RING. Impostare tra 10-300 secondi.
+  voice_call_enabled:
+    name: Chiamate vocali (Sperimentale)
+    description: "Sperimentale: Comporre numeri tramite API REST o pulsante MQTT. La chiamata squilla ~35s poi termina per timeout di rete. Il modem non è disponibile ~2 min dopo ogni chiamata (recupero automatico). Riagganciare non supportato. Consigliato solo per allarme/notifiche."

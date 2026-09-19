@@ -3,9 +3,11 @@
 ## 🚀 Quick Start
 
 ### Step 1: Connect GSM Modem
-- Connect your USB GSM modem (SIM800L, Huawei, etc.)
+- Connect your USB GSM modem
 - Verify detection: Settings → System → Hardware → Search for "ttyUSB" or "ttyACM"
 - Supported device paths: `/dev/ttyUSB0-3`, `/dev/ttyACM0`, `/dev/ttyS0`
+
+> **Hardware support:** developed and tested with **SIM800L**. Other modems (Huawei, Quectel, etc.) may work but are community-supported — see the README's "Supported hardware" section.
 
 ### Step 2: Basic Configuration
 ```yaml
@@ -64,7 +66,6 @@ curl -X POST http://192.168.1.x:5000/sms \
 |-----------|---------|-------------|
 | `device_path` | `/dev/ttyUSB0` | Path to GSM modem (supported: ttyUSB0-3, ttyACM0, ttyS0) |
 | `pin` | `""` | SIM card PIN (empty = no PIN) |
-| `port` | `5000` | API port |
 | `username` | `admin` | API username |
 | `password` | `password` | **⚠️ CHANGE THIS!** |
 
@@ -87,6 +88,7 @@ curl -X POST http://192.168.1.x:5000/sms \
 | `sms_cost_per_message` | `0.0` | Price per SMS (0 = cost tracking disabled) |
 | `sms_cost_currency` | `CZK` | Currency code (EUR, USD, CZK, GBP, etc.) |
 | `auto_delete_read_sms` | `false` | Auto-delete SMS after reading (frees SIM space) |
+| `sms_delete_delay_seconds` | `0` | Delay (0–300 s) before auto-deleting a read SMS; `0` = immediate |
 
 ## 📊 MQTT Sensors
 
@@ -174,7 +176,9 @@ automation:
 ## 📡 REST API
 
 ### Swagger Documentation
-Full API documentation: `http://your-ha-ip:5000/docs/`
+Access full API documentation via:
+- **Ingress**: Click "Open Web UI" in add-on panel, then "Open Swagger API Documentation"
+- **Direct**: `http://your-ha-ip:PORT/docs/` (PORT configurable in Network settings, default 5000)
 
 ### Main Endpoints
 
@@ -358,5 +362,5 @@ See [CHANGELOG.md](./CHANGELOG.md) for complete version history and detailed cha
 ## 🆘 Support
 
 - **Issues**: [GitHub Issues](https://github.com/pavelve/home-assistant-addons/issues)
-- **Swagger UI**: http://your-ha-ip:5000/docs/
+- **Swagger UI**: Available via Ingress or direct port access
 - **Original Project**: [sms-gammu-gateway](https://github.com/pajikos/sms-gammu-gateway)
