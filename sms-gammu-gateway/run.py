@@ -106,7 +106,7 @@ def load_ha_config():
             'sms_cost_per_message': 0.0,
             'sms_cost_currency': 'CZK',
             'auto_delete_read_sms': False,
-            'modem_baud_rate': '115200',
+            'modem_baud_rate': '9600',
             'urc_filter_enabled': True
         }
 
@@ -119,7 +119,7 @@ port = 5000  # Fixed port - must match ingress_port in config.json
 username = config.get('username', 'admin')
 password = config.get('password', 'password')
 device_path = config.get('device_path', '/dev/ttyUSB0')
-baud_rate = str(config.get('modem_baud_rate', '115200'))
+baud_rate = str(config.get('modem_baud_rate', '9600'))
 urc_filter_enabled = config.get('urc_filter_enabled', True)
 
 # Initialize MQTT publisher FIRST (before gammu)
@@ -138,8 +138,8 @@ gammu_device = device_path
 urc_proxy = None
 log_device_diagnostics(device_path)
 if urc_filter_enabled:
-    # Proxy potřebuje konkrétní rychlost reálného portu; pro 'auto' použij 115200.
-    proxy_baud = 115200 if baud_rate == 'auto' else int(baud_rate)
+    # Proxy potřebuje konkrétní rychlost reálného portu; pro 'auto' použij 9600.
+    proxy_baud = 9600 if baud_rate == 'auto' else int(baud_rate)
     try:
         urc_proxy = URCFilterProxy(device_path, proxy_baud)
         gammu_device = urc_proxy.start()

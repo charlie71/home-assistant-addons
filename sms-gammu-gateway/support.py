@@ -95,7 +95,7 @@ def log_gammu_versions():
         logging.warning(f"Could not determine gammu version: {e}")
 
 
-def probe_serial_at(device_path, baud_rates=(115200, 9600, 57600, 38400, 19200), timeout=1.5):
+def probe_serial_at(device_path, baud_rates=(9600, 115200, 57600, 38400, 19200), timeout=1.5):
     """Send a plain 'AT' to the modem at several baud rates and report who answers.
 
     Only call this when NO other component (gammu, URC proxy) holds the port,

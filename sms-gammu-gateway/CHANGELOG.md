@@ -12,6 +12,7 @@ Fork synchronised with upstream 1.7.1 (SIM800/URC filter, `modem_baud_rate`, voi
 * `sms_cost_currency` default `EUR`
 
 ### Changed
+* `modem_baud_rate` default is `9600` (SIM800L default) instead of upstream's `115200`.
 * The unsupported gammu config keys `baudrate`/`init_timeout` (ignored by gammu) were removed; the speed is now set via `modem_baud_rate` (`connection = at<baud>`).
 * The removed upstream option `port` is gone; the port is configured in the Network section.
 

@@ -11,7 +11,7 @@
   "homeassistant": "2022.1.1",
   "options": {
     "device_path": "/dev/ttyUSB0",
-    "modem_baud_rate": "115200",
+    "modem_baud_rate": "9600",
     "urc_filter_enabled": true,
     "pin": "",
     "ssl": false,
