@@ -17,7 +17,7 @@ from flask_httpauth import HTTPBasicAuth
 from flask_restx import Api, Resource, fields, reqparse, apidoc
 
 from support import (init_state_machine, retrieveAllSms, deleteSms, encodeSms,
-                     log_device_diagnostics, diagnose_init_failure)
+                     log_device_diagnostics, diagnose_init_failure, probe_serial_at)
 from mqtt_publisher import MQTTPublisher
 from urc_filter import URCFilterProxy
 from gammu import GSMNetworks
@@ -137,6 +137,18 @@ if mqtt_publisher.connected:
 gammu_device = device_path
 urc_proxy = None
 log_device_diagnostics(device_path)
+# Quick raw AT pre-flight BEFORE gammu/proxy touch the port: shows within seconds
+# whether the modem answers at all (gammu init alone can block for minutes).
+_first = [] if baud_rate == 'auto' else [int(baud_rate)]
+_preflight_bauds = tuple(_first + [b for b in (9600, 115200, 57600, 38400, 19200) if b not in _first])
+_answering, _usable = probe_serial_at(device_path, _preflight_bauds)
+if _answering:
+    logging.info(f"✅ Pre-flight: modem answers AT at {_answering} baud (configured: {baud_rate})")
+    if baud_rate != 'auto' and int(baud_rate) != _answering:
+        logging.warning(f"⚠️ Configured modem_baud_rate {baud_rate} differs - set modem_baud_rate to {_answering}")
+elif _usable:
+    logging.error("❌ Pre-flight: modem does NOT answer AT at any baud rate - check wiring (TX/RX), "
+                  "GND, power supply and UART overlay; gammu init will most likely time out")
 if urc_filter_enabled:
     # Proxy potřebuje konkrétní rychlost reálného portu; pro 'auto' použij 9600.
     proxy_baud = 9600 if baud_rate == 'auto' else int(baud_rate)
